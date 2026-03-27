@@ -6,6 +6,7 @@ Sessions are stored in a sessions/ directory as .jsonl files.
   Line 2+: messages  {"role": "...", "content": "...", ...}
 
 Append-only: new messages are appended without rewriting the file.
+All functions take sessions_dir as first argument.
 """
 
 import json
@@ -13,21 +14,14 @@ import os
 import uuid
 from datetime import datetime, timezone
 
-_script_dir = os.path.dirname(os.path.abspath(__file__))
-SESSIONS_DIR = os.path.join(_script_dir, "sessions")
+
+def _session_path(sessions_dir, session_id):
+    return os.path.join(sessions_dir, f"{session_id}.jsonl")
 
 
-def _ensure_dir():
-    os.makedirs(SESSIONS_DIR, exist_ok=True)
-
-
-def _session_path(session_id):
-    return os.path.join(SESSIONS_DIR, f"{session_id}.jsonl")
-
-
-def create_session(model):
+def create_session(sessions_dir, model):
     """Create a new session file and return its id."""
-    _ensure_dir()
+    os.makedirs(sessions_dir, exist_ok=True)
     session_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
     meta = {
         "id": session_id,
@@ -35,23 +29,23 @@ def create_session(model):
         "created": datetime.now(timezone.utc).isoformat(),
         "updated": datetime.now(timezone.utc).isoformat(),
     }
-    with open(_session_path(session_id), "w") as f:
+    with open(_session_path(sessions_dir, session_id), "w") as f:
         f.write(json.dumps(meta) + "\n")
     return session_id
 
 
-def append_messages(session_id, messages):
+def append_messages(sessions_dir, session_id, messages):
     """Append one or more messages to a session file and touch the updated timestamp."""
-    path = _session_path(session_id)
+    path = _session_path(sessions_dir, session_id)
     with open(path, "a") as f:
         for msg in messages:
             f.write(json.dumps(msg) + "\n")
-    _touch_updated(session_id)
+    _touch_updated(sessions_dir, session_id)
 
 
-def _touch_updated(session_id):
+def _touch_updated(sessions_dir, session_id):
     """Rewrite the metadata line's 'updated' field."""
-    path = _session_path(session_id)
+    path = _session_path(sessions_dir, session_id)
     with open(path, "r") as f:
         lines = f.readlines()
     meta = json.loads(lines[0])
@@ -61,9 +55,9 @@ def _touch_updated(session_id):
         f.writelines(lines)
 
 
-def load_session(session_id):
+def load_session(sessions_dir, session_id):
     """Load a session. Returns (metadata_dict, list_of_messages)."""
-    path = _session_path(session_id)
+    path = _session_path(sessions_dir, session_id)
     with open(path, "r") as f:
         lines = f.readlines()
     meta = json.loads(lines[0])
@@ -71,23 +65,23 @@ def load_session(session_id):
     return meta, messages
 
 
-def latest_session(model=None):
+def latest_session(sessions_dir, model=None):
     """Find the most recent session id, optionally filtered by model. Returns None if none exist."""
-    sessions = list_sessions(model=model)
+    sessions = list_sessions(sessions_dir, model=model)
     if not sessions:
         return None
     return sessions[0]["id"]
 
 
-def list_sessions(model=None):
+def list_sessions(sessions_dir, model=None):
     """List sessions sorted by updated (newest first). Each entry is the metadata dict."""
-    _ensure_dir()
+    os.makedirs(sessions_dir, exist_ok=True)
     result = []
-    for fname in os.listdir(SESSIONS_DIR):
+    for fname in os.listdir(sessions_dir):
         if not fname.endswith(".jsonl"):
             continue
         try:
-            with open(os.path.join(SESSIONS_DIR, fname), "r") as f:
+            with open(os.path.join(sessions_dir, fname), "r") as f:
                 meta = json.loads(f.readline())
             if model and meta.get("model") != model:
                 continue
@@ -98,9 +92,9 @@ def list_sessions(model=None):
     return result
 
 
-def export_markdown(session_id):
+def export_markdown(sessions_dir, session_id):
     """Export a session as a readable markdown string."""
-    meta, messages = load_session(session_id)
+    meta, messages = load_session(sessions_dir, session_id)
     lines = [
         f"# Session {meta['id']}",
         f"Model: {meta['model']}  ",

@@ -3,17 +3,17 @@
 test.py - Manual test script for tools, memory, and providers.
 
 Usage:
-  python test.py              Run all tests
-  python test.py tools        Run only tool tests
-  python test.py memory       Run only memory integration tests
-  python test.py providers    Run only provider tests
+  python3 test.py              Run all tests
+  python3 test.py tools        Run only tool tests
+  python3 test.py memory       Run only memory integration tests
+  python3 test.py providers    Run only provider tests
 """
 
 import os
 import sys
 
 # ---------------------------------------------------------------------------
-# Load .env (same logic as run.py)
+# Load .env (same logic as Agent)
 # ---------------------------------------------------------------------------
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -71,12 +71,15 @@ def section(title):
 # ---------------------------------------------------------------------------
 
 def test_tools():
-    from tools import run_tool
+    from agent.tools import BASE_TOOLS, make_memory_tools, run_tool
+
+    memory_dir = os.path.join(_script_dir, "memory")
+    all_tools = list(BASE_TOOLS) + make_memory_tools(memory_dir)
 
     section("Tools")
 
     # shell
-    out = run_tool("shell", {"cmd": "echo hello"})
+    out = run_tool(all_tools, "shell", {"cmd": "echo hello"})
     if "hello" in out:
         ok("shell")
     else:
@@ -85,12 +88,12 @@ def test_tools():
     # write_file + read_file
     tmp = os.path.join(_script_dir, "_test_tmp.txt")
     payload = "dead-simple-agent test content 12345"
-    out = run_tool("write_file", {"path": tmp, "content": payload})
+    out = run_tool(all_tools, "write_file", {"path": tmp, "content": payload})
     if "ERROR" in out:
         fail("write_file", out)
     else:
         ok("write_file")
-        out = run_tool("read_file", {"path": tmp})
+        out = run_tool(all_tools, "read_file", {"path": tmp})
         if out.strip() == payload:
             ok("read_file")
         else:
@@ -98,7 +101,7 @@ def test_tools():
         os.unlink(tmp)
 
     # fetch_url
-    out = run_tool("fetch_url", {"url": "https://httpbin.org/get", "as_text": False})
+    out = run_tool(all_tools, "fetch_url", {"url": "https://httpbin.org/get", "as_text": False})
     if "headers" in out.lower() or "origin" in out.lower():
         ok("fetch_url")
     elif "ERROR" in out:
@@ -108,28 +111,28 @@ def test_tools():
 
     # memory_write
     test_content = "# Test Memory\n\nThis is a test memory about ethereum and solidity."
-    out = run_tool("memory_write", {"filename": "_test_memory.md", "content": test_content})
+    out = run_tool(all_tools, "memory_write", {"filename": "_test_memory.md", "content": test_content})
     if "saved" in out.lower():
         ok("memory_write")
     else:
         fail("memory_write", out[:100])
 
     # memory_read
-    out = run_tool("memory_read", {"filename": "_test_memory.md"})
+    out = run_tool(all_tools, "memory_read", {"filename": "_test_memory.md"})
     if out.strip() == test_content.strip():
         ok("memory_read")
     else:
         fail("memory_read", f"content mismatch: {out[:80]}")
 
     # memory_list
-    out = run_tool("memory_list", {})
+    out = run_tool(all_tools, "memory_list", {})
     if "_test_memory.md" in out and "# Test Memory" in out:
         ok("memory_list")
     else:
         fail("memory_list", f"test file not found in listing: {out[:120]}")
 
     # memory_list with limit
-    out = run_tool("memory_list", {"limit": 1})
+    out = run_tool(all_tools, "memory_list", {"limit": 1})
     lines = [l for l in out.strip().split("\n") if l.strip()]
     if len(lines) <= 1:
         ok("memory_list (limit)")
@@ -137,21 +140,21 @@ def test_tools():
         fail("memory_list (limit)", f"expected <=1 line, got {len(lines)}")
 
     # memory_search
-    out = run_tool("memory_search", {"query": "ethereum"})
+    out = run_tool(all_tools, "memory_search", {"query": "ethereum"})
     if "_test_memory.md" in out and "ethereum" in out.lower():
         ok("memory_search", "found 'ethereum' in test file")
     else:
         fail("memory_search", f"search miss: {out[:120]}")
 
     # memory_search (no match)
-    out = run_tool("memory_search", {"query": "zzz_nonexistent_zzz"})
+    out = run_tool(all_tools, "memory_search", {"query": "zzz_nonexistent_zzz"})
     if "no memories match" in out.lower():
         ok("memory_search (no match)")
     else:
         fail("memory_search (no match)", f"expected no-match message: {out[:80]}")
 
     # cleanup
-    test_file = os.path.join(_script_dir, "memory", "_test_memory.md")
+    test_file = os.path.join(memory_dir, "_test_memory.md")
     if os.path.exists(test_file):
         os.unlink(test_file)
 
@@ -161,16 +164,18 @@ def test_tools():
 # ---------------------------------------------------------------------------
 
 def test_memory_integration():
-    from run import SYSTEM_PROMPT
+    from agent import Agent
+
+    a = Agent()
 
     section("Memory Integration")
 
-    if "{{MEMORY}}" in SYSTEM_PROMPT:
+    if "{{MEMORY}}" in a.system_prompt:
         fail("{{MEMORY}} replaced", "raw placeholder still in prompt")
     else:
         ok("{{MEMORY}} replaced")
 
-    if "{{TOOLS}}" in SYSTEM_PROMPT:
+    if "{{TOOLS}}" in a.system_prompt:
         fail("{{TOOLS}} replaced", "raw placeholder still in prompt")
     else:
         ok("{{TOOLS}} replaced")
@@ -179,17 +184,17 @@ def test_memory_integration():
     if os.path.exists(critical_path):
         with open(critical_path) as f:
             content = f.read().strip()
-        if content and content in SYSTEM_PROMPT:
+        if content and content in a.system_prompt:
             ok("critical.md in prompt", f"{len(content)} chars loaded")
         else:
             fail("critical.md in prompt", "file exists but content not found in prompt")
     else:
-        if "No critical memories yet" in SYSTEM_PROMPT:
+        if "No critical memories yet" in a.system_prompt:
             ok("critical.md fallback", "placeholder text present")
         else:
             fail("critical.md fallback", "no fallback text found")
 
-    if "memory_list" in SYSTEM_PROMPT and "memory_search" in SYSTEM_PROMPT:
+    if "memory_list" in a.system_prompt and "memory_search" in a.system_prompt:
         ok("memory tools in prompt")
     else:
         fail("memory tools in prompt", "memory tool names missing from system prompt")
@@ -238,11 +243,16 @@ PROVIDER_TESTS = {
         "skip_if": lambda: not os.environ.get("BANKR_API_KEY"),
         "skip_reason": "no BANKR_API_KEY",
     },
+    "openrouter": {
+        "model": "openrouter/auto",
+        "skip_if": lambda: not os.environ.get("OPENROUTER_API_KEY"),
+        "skip_reason": "no OPENROUTER_API_KEY",
+    },
 }
 
 
 def test_providers():
-    from providers import get_chat_fn
+    from agent.providers import get_chat_fn
 
     section("Providers")
 

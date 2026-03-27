@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: dead-simple-agent
+Version: 0.1.0
+Summary: A local AI agent in ~1000 lines of Python. No frameworks, no abstractions.
+Requires-Python: >=3.8
+Requires-Dist: requests

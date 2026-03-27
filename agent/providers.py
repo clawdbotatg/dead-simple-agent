@@ -89,11 +89,27 @@ def bankr_chat(model, messages, tool_specs):
 
 
 # ---------------------------------------------------------------------------
+# OpenRouter  (OpenAI-compatible, multi-provider)
+# https://openrouter.ai/docs
+# ---------------------------------------------------------------------------
+
+def openrouter_chat(model, messages, tool_specs):
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    base_url = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+
+    if not api_key:
+        print("ERROR: OPENROUTER_API_KEY not set in .env", file=sys.stderr)
+        return None
+
+    return _openai_compatible_chat(model, messages, tool_specs, api_key, base_url)
+
+
+# ---------------------------------------------------------------------------
 # Anthropic  (native Messages API)
 # ---------------------------------------------------------------------------
 
 def _convert_tools_to_anthropic(tool_specs):
-    """OpenAI tool specs → Anthropic tool specs."""
+    """OpenAI tool specs -> Anthropic tool specs."""
     tools = []
     for spec in tool_specs:
         fn = spec.get("function", {})
@@ -106,10 +122,10 @@ def _convert_tools_to_anthropic(tool_specs):
 
 
 def _convert_messages_to_anthropic(messages):
-    """OpenAI-style messages → Anthropic (system, messages) pair.
+    """OpenAI-style messages -> Anthropic (system, messages) pair.
 
-    Handles: system extraction, assistant tool_calls → tool_use blocks,
-    tool role → user tool_result blocks, and merging consecutive same-role
+    Handles: system extraction, assistant tool_calls -> tool_use blocks,
+    tool role -> user tool_result blocks, and merging consecutive same-role
     messages (which Anthropic forbids).
     """
     system = ""
@@ -154,8 +170,6 @@ def _convert_messages_to_anthropic(messages):
                 "tool_use_id": msg.get("tool_call_id", "call_0"),
                 "content": msg.get("content", ""),
             }
-            # Anthropic requires tool_result inside a user message.
-            # Merge with previous user message if it's already tool_results.
             if anthropic_msgs and anthropic_msgs[-1]["role"] == "user" and isinstance(anthropic_msgs[-1]["content"], list):
                 anthropic_msgs[-1]["content"].append(tool_result)
             else:
@@ -226,9 +240,6 @@ def anthropic_chat(model, messages, tool_specs):
 
 # ---------------------------------------------------------------------------
 # Shared: OpenAI-compatible request/response handling
-#
-# Any provider that speaks the OpenAI /v1/chat/completions format can reuse
-# this.  Just call it with the right api_key and base_url.
 # ---------------------------------------------------------------------------
 
 def _openai_compatible_chat(model, messages, tool_specs, api_key, base_url):
@@ -253,8 +264,6 @@ def _openai_compatible_chat(model, messages, tool_specs, api_key, base_url):
         print(f"ERROR: Request to {url} timed out (300s)", file=sys.stderr)
         return None
 
-    # If the API rejects the tools param, retry without tools so the model
-    # can still answer (just without tool use).
     if resp.status_code == 400 and "tools" in resp.text.lower() and "tools" in body:
         print(f"WARN: {model} does not support tools, retrying without", file=sys.stderr)
         del body["tools"]
@@ -290,6 +299,7 @@ PROVIDERS = {
     "ollama": ollama_chat,
     "venice": venice_chat,
     "bankr": bankr_chat,
+    "openrouter": openrouter_chat,
     "anthropic": anthropic_chat,
 }
 
@@ -300,15 +310,15 @@ def detect_provider(model):
     """Guess the provider from the model name. Falls back to ollama."""
     model_lower = model.lower()
 
-    # Venice models
     if "venice" in model_lower:
         return "venice"
 
-    # Anthropic native API (preferred for Claude when key is set)
+    if model_lower.startswith("openrouter/") and os.environ.get("OPENROUTER_API_KEY"):
+        return "openrouter"
+
     if model_lower.startswith("claude") and os.environ.get("ANTHROPIC_API_KEY"):
         return "anthropic"
 
-    # Cloud models via Bankr gateway (Claude, GPT, Gemini, Kimi, Qwen)
     if model_lower.startswith(_BANKR_PREFIXES) and os.environ.get("BANKR_API_KEY"):
         return "bankr"
 

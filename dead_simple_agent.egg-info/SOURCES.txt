@@ -1,0 +1,14 @@
+README.md
+pyproject.toml
+agent/__init__.py
+agent/core.py
+agent/default_prompt.md
+agent/providers.py
+agent/sessions.py
+agent/tools.py
+dead_simple_agent.egg-info/PKG-INFO
+dead_simple_agent.egg-info/SOURCES.txt
+dead_simple_agent.egg-info/dependency_links.txt
+dead_simple_agent.egg-info/entry_points.txt
+dead_simple_agent.egg-info/requires.txt
+dead_simple_agent.egg-info/top_level.txt

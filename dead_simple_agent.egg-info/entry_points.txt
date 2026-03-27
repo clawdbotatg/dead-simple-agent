@@ -1,0 +1,2 @@
+[console_scripts]
+dead-simple-agent = agent.core:_cli_entry
