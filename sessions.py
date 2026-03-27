@@ -1,5 +1,5 @@
 """
-sessions.py - JSONL-based session persistence for qwen-run.
+sessions.py - JSONL-based session persistence for the agent.
 
 Sessions are stored in a sessions/ directory as .jsonl files.
   Line 1:  metadata  {"id": "...", "model": "...", "created": "...", "updated": "..."}

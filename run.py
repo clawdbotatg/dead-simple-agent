@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-qwen-run.py - Run a Qwen model with tool support from the command line.
+run.py - Run any LLM with tool support from the command line.
 
 Usage:
-  qwen-run.py <model>                     Continue last session (or start new)
-  qwen-run.py <model> <prompt>            One-shot: run prompt and exit
-  qwen-run.py <model> --new               Force a fresh session
-  qwen-run.py <model> --resume <id>       Resume a specific session by id
+  run.py <model>                     Continue last session (or start new)
+  run.py <model> <prompt>            One-shot: run prompt and exit
+  run.py <model> --new               Force a fresh session
+  run.py <model> --resume <id>       Resume a specific session by id
+  run.py <model> --provider <name>   Use a specific provider (default: auto-detect)
+
+Providers:
+  ollama (default), venice — see providers.py to add more.
 
 Config:
-  .env              - OLLAMA_URL
+  .env              - API keys and URLs
   system_prompt.md  - system prompt (editable markdown)
   tools.py          - tool definitions + implementations
 """
@@ -21,8 +25,7 @@ import readline  # noqa: F401 — imported for input() line-editing support
 import sys
 import textwrap
 
-import requests
-
+from providers import detect_provider, get_chat_fn
 from sessions import (
     append_messages,
     create_session,
@@ -47,8 +50,6 @@ if os.path.exists(_env_path):
                 _k, _v = _line.split("=", 1)
                 os.environ.setdefault(_k.strip(), _v.strip())
 
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/chat")
-
 # ---------------------------------------------------------------------------
 # Load system prompt from markdown file
 # ---------------------------------------------------------------------------
@@ -58,53 +59,22 @@ with open(_prompt_path, "r") as _f:
 
 
 # ---------------------------------------------------------------------------
-# Ollama chat
-# ---------------------------------------------------------------------------
-
-def chat(model, messages):
-    try:
-        resp = requests.post(OLLAMA_URL, json={
-            "model": model,
-            "messages": messages,
-            "tools": get_tool_specs(),
-            "stream": False,
-        }, timeout=300)
-    except requests.ConnectionError:
-        print(f"ERROR: Cannot connect to Ollama at {OLLAMA_URL}", file=sys.stderr)
-        print("Is Ollama running? Check OLLAMA_URL in .env", file=sys.stderr)
-        return None
-    except requests.Timeout:
-        print("ERROR: Ollama request timed out (300s)", file=sys.stderr)
-        return None
-
-    if resp.status_code == 404:
-        print(f"ERROR: Model '{model}' not found or Ollama API unavailable at {OLLAMA_URL}", file=sys.stderr)
-        print("Try: ollama pull <model>", file=sys.stderr)
-        return None
-    if not resp.ok:
-        print(f"ERROR: Ollama returned {resp.status_code}: {resp.text[:200]}", file=sys.stderr)
-        return None
-
-    return resp.json()
-
-
-# ---------------------------------------------------------------------------
 # Agent loop — runs one user turn (may involve multiple tool-call rounds)
 # Returns the list of new messages added during this turn.
 # ---------------------------------------------------------------------------
 
-def agent_turn(model, messages):
+def agent_turn(chat_fn, model, messages):
     new_messages = []
 
     for _ in range(10):
-        result = chat(model, messages)
+        result = chat_fn(model, messages, get_tool_specs())
         if result is None:
             return new_messages
-        msg = result.get("message", {})
-        tool_calls = msg.get("tool_calls", [])
+
+        content = result.get("content", "").strip()
+        tool_calls = result.get("tool_calls", [])
 
         if not tool_calls:
-            content = msg.get("content", "").strip()
             assistant_msg = {"role": "assistant", "content": content}
             messages.append(assistant_msg)
             new_messages.append(assistant_msg)
@@ -113,7 +83,7 @@ def agent_turn(model, messages):
 
         assistant_msg = {
             "role": "assistant",
-            "content": msg.get("content", ""),
+            "content": content,
             "tool_calls": tool_calls,
         }
         messages.append(assistant_msg)
@@ -141,13 +111,13 @@ def agent_turn(model, messages):
 # One-shot mode (no session persistence)
 # ---------------------------------------------------------------------------
 
-def run_once(model, prompt):
+def run_once(chat_fn, model, prompt):
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": prompt},
     ]
     print(f"🤖 {model}", file=sys.stderr)
-    agent_turn(model, messages)
+    agent_turn(chat_fn, model, messages)
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +208,7 @@ def _handle_slash(cmd, session_id, model, messages):
     return None
 
 
-def run_interactive(model, resume_id=None):
+def run_interactive(chat_fn, model, resume_id=None):
     if resume_id:
         session_id = resume_id
         meta, messages = load_session(session_id)
@@ -281,7 +251,7 @@ def run_interactive(model, resume_id=None):
         messages.append(user_msg)
         append_messages(session_id, [user_msg])
 
-        new_messages = agent_turn(model, messages)
+        new_messages = agent_turn(chat_fn, model, messages)
         if new_messages:
             append_messages(session_id, new_messages)
 
@@ -296,11 +266,15 @@ def run_interactive(model, resume_id=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run a Qwen model with tool support.",
-        usage="%(prog)s <model> [prompt...] [--new | --resume SESSION_ID]",
+        description="Run an LLM with tool support.",
+        usage="%(prog)s <model> [prompt...] [--provider NAME] [--new | --resume SESSION_ID]",
     )
-    parser.add_argument("model", help="Ollama model name (e.g. qwen3:32b)")
+    parser.add_argument("model", help="Model name (e.g. qwen3:32b, venice-uncensored)")
     parser.add_argument("prompt", nargs="*", help="Prompt (omit for interactive mode)")
+    parser.add_argument(
+        "--provider", default=None,
+        help="Provider backend: ollama, venice, ... (default: auto-detect from model name)",
+    )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--new", action="store_true",
@@ -317,15 +291,23 @@ def main():
     if prompt and args.resume:
         parser.error("Cannot combine a prompt with --resume")
 
+    provider_name = args.provider or detect_provider(args.model)
+    try:
+        chat_fn = get_chat_fn(provider_name)
+    except KeyError as e:
+        parser.error(str(e))
+
+    print(f"Provider: {provider_name}", file=sys.stderr)
+
     if prompt:
-        run_once(args.model, prompt)
+        run_once(chat_fn, args.model, prompt)
     else:
         resume_id = None
         if args.resume:
             resume_id = args.resume
         elif not args.new:
             resume_id = latest_session(model=args.model)
-        run_interactive(args.model, resume_id=resume_id)
+        run_interactive(chat_fn, args.model, resume_id=resume_id)
 
 
 if __name__ == "__main__":

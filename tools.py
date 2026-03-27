@@ -1,5 +1,5 @@
 """
-tools.py - Tool definitions and implementations for qwen-run.
+tools.py - Tool definitions and implementations for the agent.
 
 Each tool is a dict with:
   - "spec": the Ollama tool schema (passed to the model)
