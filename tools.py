@@ -11,6 +11,7 @@ To add a new tool, append a new entry to TOOL_REGISTRY at the bottom.
 import os
 import json
 import subprocess
+from datetime import datetime, timezone
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +74,88 @@ def _run_write_file(args):
         with open(path, "w") as f:
             f.write(args["content"])
         return f"Written to {path}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Memory tool implementations
+# ---------------------------------------------------------------------------
+
+_MEMORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory")
+
+
+def _run_memory_list(args):
+    try:
+        os.makedirs(_MEMORY_DIR, exist_ok=True)
+        files = [f for f in os.listdir(_MEMORY_DIR) if os.path.isfile(os.path.join(_MEMORY_DIR, f))]
+        if not files:
+            return "(no memory files yet)"
+
+        entries = []
+        for fname in files:
+            fpath = os.path.join(_MEMORY_DIR, fname)
+            mtime = os.path.getmtime(fpath)
+            modified = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            with open(fpath, "r") as f:
+                first_line = f.readline().strip() or "(empty)"
+            entries.append((mtime, fname, modified, first_line))
+
+        entries.sort(key=lambda e: e[0], reverse=True)
+        limit = args.get("limit", 20)
+        if limit:
+            entries = entries[:limit]
+        lines = [f"{fname}  (modified: {mod})  — {first_line}" for _, fname, mod, first_line in entries]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+def _run_memory_read(args):
+    try:
+        fname = args["filename"]
+        fpath = os.path.join(_MEMORY_DIR, fname)
+        with open(fpath, "r") as f:
+            return f.read()
+    except FileNotFoundError:
+        return f"ERROR: memory file '{fname}' not found"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+def _run_memory_write(args):
+    try:
+        os.makedirs(_MEMORY_DIR, exist_ok=True)
+        fname = args["filename"]
+        fpath = os.path.join(_MEMORY_DIR, fname)
+        with open(fpath, "w") as f:
+            f.write(args["content"])
+        return f"Memory saved to {fname}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+def _run_memory_search(args):
+    try:
+        os.makedirs(_MEMORY_DIR, exist_ok=True)
+        query = args["query"].lower()
+        files = [f for f in os.listdir(_MEMORY_DIR) if os.path.isfile(os.path.join(_MEMORY_DIR, f))]
+        if not files:
+            return "(no memory files yet)"
+
+        results = []
+        for fname in files:
+            fpath = os.path.join(_MEMORY_DIR, fname)
+            with open(fpath, "r") as f:
+                lines = f.readlines()
+            matches = [(i + 1, line.strip()) for i, line in enumerate(lines) if query in line.lower()]
+            if matches:
+                snippets = [f"  L{num}: {text[:120]}" for num, text in matches[:5]]
+                results.append(f"{fname} ({len(matches)} match{'es' if len(matches) != 1 else ''}):\n" + "\n".join(snippets))
+
+        if not results:
+            return f"No memories match '{args['query']}'"
+        return "\n\n".join(results)
     except Exception as e:
         return f"ERROR: {e}"
 
@@ -271,6 +354,75 @@ TOOL_REGISTRY = [
             },
         },
         "run": _run_write_file,
+    },
+    {
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "memory_list",
+                "description": "List memory files sorted by most recently modified. Returns filename, modified date, and first-line preview.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "description": "Max files to return (default 20, 0 for all)"},
+                    },
+                    "required": [],
+                },
+            },
+        },
+        "run": _run_memory_list,
+    },
+    {
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "memory_read",
+                "description": "Read the contents of a memory file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filename": {"type": "string", "description": "Name of the memory file (e.g. 'critical.md', 'projects.md')"},
+                    },
+                    "required": ["filename"],
+                },
+            },
+        },
+        "run": _run_memory_read,
+    },
+    {
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "memory_write",
+                "description": "Create or update a memory file. Use 'critical.md' for facts that should always be in context. Use other filenames for topic-specific notes.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filename": {"type": "string", "description": "Name of the memory file (e.g. 'critical.md', 'projects.md')"},
+                        "content": {"type": "string", "description": "Content to write to the memory file"},
+                    },
+                    "required": ["filename", "content"],
+                },
+            },
+        },
+        "run": _run_memory_write,
+    },
+    {
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "memory_search",
+                "description": "Search across all memory files for a keyword or phrase. Returns matching filenames with line snippets.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Text to search for (case-insensitive)"},
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+        "run": _run_memory_search,
     },
     {
         "spec": {

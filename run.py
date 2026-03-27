@@ -57,7 +57,14 @@ _prompt_path = os.path.join(_script_dir, "system_prompt.md")
 with open(_prompt_path, "r") as _f:
     _raw_prompt = _f.read().strip()
 
-SYSTEM_PROMPT = _raw_prompt.replace("{{TOOLS}}", get_tool_summary())
+_memory_path = os.path.join(_script_dir, "memory", "critical.md")
+_critical_memory = ""
+if os.path.exists(_memory_path):
+    with open(_memory_path, "r") as _f:
+        _critical_memory = _f.read().strip()
+_critical_memory = _critical_memory or "(No critical memories yet. Use memory_write with filename 'critical.md' to create one.)"
+
+SYSTEM_PROMPT = _raw_prompt.replace("{{TOOLS}}", get_tool_summary()).replace("{{MEMORY}}", _critical_memory)
 
 
 # ---------------------------------------------------------------------------
