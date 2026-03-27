@@ -175,11 +175,7 @@ def anthropic_chat(model, messages, tool_specs):
     system, anthropic_msgs = _convert_messages_to_anthropic(messages)
 
     url = f"{base_url.rstrip('/')}/v1/messages"
-    headers = {"anthropic-version": "2023-06-01", "Content-Type": "application/json"}
-    if api_key.startswith("sk-ant-oat01-"):
-        headers["Authorization"] = f"Bearer {api_key}"
-    else:
-        headers["x-api-key"] = api_key
+    headers = {"anthropic-version": "2023-06-01", "Content-Type": "application/json", "x-api-key": api_key}
     body = {
         "model": model,
         "max_tokens": 4096,
