@@ -1,6 +1,6 @@
 # dead-simple-agent
 
-A local AI agent in ~400 lines of Python. Runs any LLM with tool use, session persistence, and auto-resume.
+A local AI agent in ~1000 lines of Python. Runs any LLM with tool use, session persistence, and auto-resume.
 
 No frameworks. No abstractions. Just a loop that calls a model, executes tools, and saves the conversation.
 

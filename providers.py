@@ -73,6 +73,162 @@ def venice_chat(model, messages, tool_specs):
 
 
 # ---------------------------------------------------------------------------
+# Bankr LLM Gateway  (OpenAI-compatible, multi-provider)
+# https://docs.bankr.bot/llm-gateway/overview
+# ---------------------------------------------------------------------------
+
+def bankr_chat(model, messages, tool_specs):
+    api_key = os.environ.get("BANKR_API_KEY", "")
+    base_url = os.environ.get("BANKR_BASE_URL", "https://llm.bankr.bot/v1")
+
+    if not api_key:
+        print("ERROR: BANKR_API_KEY not set in .env", file=sys.stderr)
+        return None
+
+    return _openai_compatible_chat(model, messages, tool_specs, api_key, base_url)
+
+
+# ---------------------------------------------------------------------------
+# Anthropic  (native Messages API)
+# ---------------------------------------------------------------------------
+
+def _convert_tools_to_anthropic(tool_specs):
+    """OpenAI tool specs → Anthropic tool specs."""
+    tools = []
+    for spec in tool_specs:
+        fn = spec.get("function", {})
+        tools.append({
+            "name": fn["name"],
+            "description": fn.get("description", ""),
+            "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
+        })
+    return tools
+
+
+def _convert_messages_to_anthropic(messages):
+    """OpenAI-style messages → Anthropic (system, messages) pair.
+
+    Handles: system extraction, assistant tool_calls → tool_use blocks,
+    tool role → user tool_result blocks, and merging consecutive same-role
+    messages (which Anthropic forbids).
+    """
+    system = ""
+    anthropic_msgs = []
+
+    for msg in messages:
+        role = msg.get("role")
+
+        if role == "system":
+            system = msg.get("content", "")
+            continue
+
+        if role == "user":
+            anthropic_msgs.append({"role": "user", "content": msg["content"]})
+
+        elif role == "assistant":
+            content_blocks = []
+            text = (msg.get("content") or "").strip()
+            if text:
+                content_blocks.append({"type": "text", "text": text})
+
+            for tc in msg.get("tool_calls", []):
+                fn = tc["function"]
+                args = fn["arguments"]
+                if isinstance(args, str):
+                    args = json.loads(args)
+                content_blocks.append({
+                    "type": "tool_use",
+                    "id": tc.get("id", "call_0"),
+                    "name": fn["name"],
+                    "input": args,
+                })
+
+            anthropic_msgs.append({
+                "role": "assistant",
+                "content": content_blocks if content_blocks else [{"type": "text", "text": ""}],
+            })
+
+        elif role == "tool":
+            tool_result = {
+                "type": "tool_result",
+                "tool_use_id": msg.get("tool_call_id", "call_0"),
+                "content": msg.get("content", ""),
+            }
+            # Anthropic requires tool_result inside a user message.
+            # Merge with previous user message if it's already tool_results.
+            if anthropic_msgs and anthropic_msgs[-1]["role"] == "user" and isinstance(anthropic_msgs[-1]["content"], list):
+                anthropic_msgs[-1]["content"].append(tool_result)
+            else:
+                anthropic_msgs.append({"role": "user", "content": [tool_result]})
+
+    return system, anthropic_msgs
+
+
+def anthropic_chat(model, messages, tool_specs):
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    base_url = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+
+    if not api_key:
+        print("ERROR: ANTHROPIC_API_KEY not set in .env", file=sys.stderr)
+        return None
+
+    system, anthropic_msgs = _convert_messages_to_anthropic(messages)
+
+    url = f"{base_url.rstrip('/')}/v1/messages"
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": model,
+        "max_tokens": 4096,
+        "messages": anthropic_msgs,
+    }
+    if system:
+        body["system"] = system
+
+    anthropic_tools = _convert_tools_to_anthropic(tool_specs) if tool_specs else []
+    if anthropic_tools:
+        body["tools"] = anthropic_tools
+
+    try:
+        resp = requests.post(url, headers=headers, json=body, timeout=300)
+    except requests.ConnectionError:
+        print(f"ERROR: Cannot connect to {url}", file=sys.stderr)
+        return None
+    except requests.Timeout:
+        print(f"ERROR: Request to {url} timed out (300s)", file=sys.stderr)
+        return None
+
+    if not resp.ok:
+        print(f"ERROR: {url} returned {resp.status_code}: {resp.text[:300]}", file=sys.stderr)
+        return None
+
+    data = resp.json()
+    content_blocks = data.get("content", [])
+
+    text_parts = []
+    tool_calls = []
+    for block in content_blocks:
+        if block["type"] == "text":
+            text_parts.append(block["text"])
+        elif block["type"] == "tool_use":
+            tool_calls.append({
+                "id": block["id"],
+                "function": {
+                    "name": block["name"],
+                    "arguments": block["input"],
+                },
+            })
+
+    return {
+        "content": "\n".join(text_parts),
+        "tool_calls": tool_calls,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Shared: OpenAI-compatible request/response handling
 #
 # Any provider that speaks the OpenAI /v1/chat/completions format can reuse
@@ -137,8 +293,12 @@ def _openai_compatible_chat(model, messages, tool_specs, api_key, base_url):
 PROVIDERS = {
     "ollama": ollama_chat,
     "venice": venice_chat,
+    "bankr": bankr_chat,
+    "anthropic": anthropic_chat,
 }
 
+
+_BANKR_PREFIXES = ("claude-", "gpt-", "gemini-", "kimi-", "qwen3-")
 
 def detect_provider(model):
     """Guess the provider from the model name. Falls back to ollama."""
@@ -148,13 +308,13 @@ def detect_provider(model):
     if "venice" in model_lower:
         return "venice"
 
-    # OpenAI models (for when you add an openai provider)
-    # if model_lower.startswith(("gpt-", "o1", "o3", "o4")):
-    #     return "openai"
+    # Anthropic native API (preferred for Claude when key is set)
+    if model_lower.startswith("claude") and os.environ.get("ANTHROPIC_API_KEY"):
+        return "anthropic"
 
-    # Anthropic models
-    # if model_lower.startswith("claude"):
-    #     return "anthropic"
+    # Cloud models via Bankr gateway (Claude, GPT, Gemini, Kimi, Qwen)
+    if model_lower.startswith(_BANKR_PREFIXES) and os.environ.get("BANKR_API_KEY"):
+        return "bankr"
 
     return "ollama"
 

@@ -10,7 +10,7 @@ Usage:
   run.py <model> --provider <name>   Use a specific provider (default: auto-detect)
 
 Providers:
-  ollama (default), venice — see providers.py to add more.
+  ollama (default), venice, bankr, anthropic — see providers.py to add more.
 
 Config:
   .env              - API keys and URLs
