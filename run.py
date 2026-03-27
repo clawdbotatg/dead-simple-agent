@@ -34,7 +34,7 @@ from sessions import (
     list_sessions,
     load_session,
 )
-from tools import get_tool_specs, run_tool
+from tools import get_tool_specs, get_tool_summary, run_tool
 
 # ---------------------------------------------------------------------------
 # Load .env from same directory as this script
@@ -55,7 +55,9 @@ if os.path.exists(_env_path):
 # ---------------------------------------------------------------------------
 _prompt_path = os.path.join(_script_dir, "system_prompt.md")
 with open(_prompt_path, "r") as _f:
-    SYSTEM_PROMPT = _f.read().strip()
+    _raw_prompt = _f.read().strip()
+
+SYSTEM_PROMPT = _raw_prompt.replace("{{TOOLS}}", get_tool_summary())
 
 
 # ---------------------------------------------------------------------------

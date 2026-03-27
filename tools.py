@@ -421,6 +421,27 @@ def get_tool_specs():
     return [t["spec"] for t in TOOL_REGISTRY]
 
 
+def get_tool_summary():
+    """Auto-generate a readable tool list for injection into the system prompt."""
+    lines = []
+    for t in TOOL_REGISTRY:
+        fn = t["spec"]["function"]
+        name = fn["name"]
+        desc = fn.get("description", "")
+        params = fn.get("parameters", {}).get("properties", {})
+        required = fn.get("parameters", {}).get("required", [])
+
+        param_parts = []
+        for pname, pinfo in params.items():
+            req = " (required)" if pname in required else ""
+            param_parts.append(f"  - {pname}: {pinfo.get('description', pinfo.get('type', ''))}{req}")
+
+        lines.append(f"- **{name}**: {desc}")
+        if param_parts:
+            lines.extend(param_parts)
+    return "\n".join(lines)
+
+
 def run_tool(name, args):
     """Dispatch a tool call by name. Returns the tool's string output."""
     for t in TOOL_REGISTRY:
