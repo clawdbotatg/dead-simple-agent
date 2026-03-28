@@ -22,9 +22,10 @@ from datetime import datetime, timezone
 def _run_shell(args):
     try:
         env = os.environ.copy()
+        home = os.path.expanduser("~")
         env["PATH"] = (
             "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-            ":/opt/homebrew/bin:/opt/homebrew/opt/node@22/bin:"
+            f":/opt/homebrew/bin:/opt/homebrew/opt/node@22/bin:{home}/.foundry/bin:"
             + env.get("PATH", "")
         )
         result = subprocess.run(

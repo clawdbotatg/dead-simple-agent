@@ -54,6 +54,7 @@ class Agent:
         memory_dir=None,
         sessions_dir=None,
         env_file=None,
+        max_iterations=10,
     ):
         cwd = os.getcwd()
 
@@ -69,6 +70,9 @@ class Agent:
         self.tools = list(BASE_TOOLS) + make_memory_tools(self.memory_dir)
         if extra_tools:
             self.tools.extend(extra_tools)
+
+        # Config
+        self.max_iterations = max_iterations
 
         # Build system prompt
         self.system_prompt = self._build_prompt(system_prompt)
@@ -103,7 +107,7 @@ class Agent:
         """Run one user turn (may involve multiple tool-call rounds)."""
         new_messages = []
 
-        for _ in range(10):
+        for _ in range(self.max_iterations):
             result = chat_fn(model, messages, get_tool_specs(self.tools))
             if result is None:
                 return new_messages
