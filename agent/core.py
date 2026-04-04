@@ -82,6 +82,81 @@ def _compact_context(messages, keep_recent=10):
     return saved
 
 
+_STAGE_SIGNALS = {
+    "deep_fetch": "loading skill docs",
+    "leftclaw_get_job": "reading job description",
+    "leftclaw_get_messages": "checking client messages",
+    "leftclaw_accept_job": "accepting job",
+    "leftclaw_log_work": "logging stage progress on-chain",
+    "leftclaw_complete_job": "completing job",
+    "github_list_repos": "reconnaissance — scanning repos",
+    "github_read_file": "reconnaissance — reading repo files",
+    "github_create_issue": "filing audit issues",
+    "github_create_pr": "creating pull request",
+    "github_write_file": "pushing code to GitHub",
+    "read_file": "reading local files",
+    "source_grep": "searching codebase",
+}
+
+def _detect_phase(messages):
+    """Detect the current phase from recent tool calls and assistant thinking."""
+    import re
+
+    phase = None
+    intent = None
+
+    for msg in reversed(messages[-20:]):
+        if msg.get("role") == "assistant":
+            text = (msg.get("content") or "").strip()
+            if text and not intent:
+                think_match = re.search(r"<think>\s*(.+?)(?:\n|</think>)", text, re.DOTALL)
+                if think_match:
+                    raw = think_match.group(1).strip()
+                    first_line = raw.split("\n")[0].strip()
+                    intent = first_line[:120]
+                elif not text.startswith("<"):
+                    intent = text.split("\n")[0].strip()[:120]
+
+            for tc in msg.get("tool_calls", []):
+                name = tc.get("function", {}).get("name", "")
+                if not phase and name in _STAGE_SIGNALS:
+                    phase = _STAGE_SIGNALS[name]
+                if name == "write_file":
+                    args = tc.get("function", {}).get("arguments", {})
+                    path = args.get("path", "") if isinstance(args, dict) else ""
+                    if ".sol" in path:
+                        phase = "writing Solidity contracts"
+                    elif ".tsx" in path or ".jsx" in path:
+                        phase = "writing frontend code"
+                    elif ".t.sol" in path:
+                        phase = "writing tests"
+                    else:
+                        phase = "writing files"
+                if name == "shell":
+                    args = tc.get("function", {}).get("arguments", {})
+                    cmd = args.get("cmd", "") if isinstance(args, dict) else ""
+                    if "forge build" in cmd:
+                        phase = "compiling contracts"
+                    elif "forge test" in cmd:
+                        phase = "running tests"
+                    elif "yarn deploy" in cmd or "forge script" in cmd or "forge create" in cmd:
+                        phase = "deploying contracts"
+                    elif "bgipfs" in cmd:
+                        phase = "deploying to IPFS"
+                    elif "git push" in cmd or "git commit" in cmd:
+                        phase = "pushing to GitHub"
+                    elif "ls " in cmd or "cat " in cmd or "find " in cmd:
+                        if not phase:
+                            phase = "exploring codebase"
+                    elif "npx" in cmd or "create-eth" in cmd:
+                        phase = "scaffolding project"
+
+        if phase and intent:
+            break
+
+    return phase or "starting", intent
+
+
 def _debug_dashboard(iteration, max_iter, model, messages, total_tool_calls, running_cost):
     """Print the step-debugger dashboard and wait for user input."""
     from .providers import context_chars, estimate_cost, PRICING
@@ -90,6 +165,8 @@ def _debug_dashboard(iteration, max_iter, model, messages, total_tool_calls, run
     est_tokens = ctx // 4
     prices = PRICING.get(model, (5.0, 15.0))
     est_call_cost = est_tokens / 1_000_000 * prices[0]
+
+    phase, intent = _detect_phase(messages)
 
     last_actions = []
     for msg in reversed(messages[-10:]):
@@ -101,16 +178,16 @@ def _debug_dashboard(iteration, max_iter, model, messages, total_tool_calls, run
             for tc in msg.get("tool_calls", []):
                 name = tc.get("function", {}).get("name", "?")
                 last_actions.append(f"    {name}")
-            text = (msg.get("content") or "").strip()
-            if text:
-                last_actions.append(f"    AI: \"{text[:100]}{'...' if len(text) > 100 else ''}\"")
         if len(last_actions) >= 6:
             break
     last_actions.reverse()
 
-    bar = "=" * 50
+    bar = "=" * 60
     print(f"\n{bar}", file=sys.stderr)
     print(f"  ITERATION {iteration + 1} / {max_iter}  |  Tool calls: {total_tool_calls}", file=sys.stderr)
+    print(f"  Phase: {phase}", file=sys.stderr)
+    if intent:
+        print(f"  Intent: {intent}", file=sys.stderr)
     print(f"  Model: {model}", file=sys.stderr)
     print(f"  Context: {len(messages)} msgs, ~{ctx_k} chars (~{est_tokens:,} tokens)", file=sys.stderr)
     print(f"  Est. cost this call: ~${est_call_cost:.3f}", file=sys.stderr)
