@@ -17,8 +17,64 @@ To add a new provider:
 import json
 import os
 import sys
+import time as _time
+from datetime import datetime as _datetime
 
 import requests
+
+
+# ---------------------------------------------------------------------------
+# Cost tracking and per-call logging
+# ---------------------------------------------------------------------------
+
+PRICING = {
+    "claude-opus-4.6": (15.0, 75.0),
+    "claude-opus-4-20250514": (15.0, 75.0),
+    "claude-sonnet-4.6": (3.0, 15.0),
+    "claude-sonnet-4-20250514": (3.0, 15.0),
+    "claude-haiku-3.5": (0.80, 4.0),
+    "gpt-4o": (2.50, 10.0),
+    "gpt-4o-mini": (0.15, 0.60),
+    "minimax-m2.7": (0.50, 1.50),
+}
+
+cumulative_cost = 0.0
+cumulative_input_tokens = 0
+cumulative_output_tokens = 0
+
+
+def estimate_cost(model, input_tokens, output_tokens):
+    prices = PRICING.get(model, (5.0, 15.0))
+    return (input_tokens / 1_000_000 * prices[0]) + (output_tokens / 1_000_000 * prices[1])
+
+
+def context_chars(messages):
+    total = 0
+    for m in messages:
+        total += len(m.get("content", "") or "")
+        for tc in m.get("tool_calls", []):
+            args = tc.get("function", {}).get("arguments", "")
+            total += len(args) if isinstance(args, str) else len(json.dumps(args))
+    return total
+
+
+def _log_api(model, messages, usage, elapsed_s):
+    global cumulative_cost, cumulative_input_tokens, cumulative_output_tokens
+    ts = _datetime.now().strftime("%H:%M:%S")
+    ctx = context_chars(messages)
+    tok_in = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+    tok_out = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+    cost = estimate_cost(model, tok_in, tok_out)
+    cumulative_cost += cost
+    cumulative_input_tokens += tok_in
+    cumulative_output_tokens += tok_out
+    ctx_k = f"{ctx // 1000}K" if ctx >= 1000 else str(ctx)
+    print(
+        f"[{ts}] API {model} msgs={len(messages)} ctx={ctx_k} "
+        f"tok_in={tok_in} tok_out={tok_out} "
+        f"cost=${cost:.3f} total=${cumulative_cost:.2f} time={elapsed_s:.1f}s",
+        file=sys.stderr,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +258,7 @@ def anthropic_chat(model, messages, tool_specs):
     if anthropic_tools:
         body["tools"] = anthropic_tools
 
+    t0 = _time.time()
     try:
         resp = requests.post(url, headers=headers, json=body, timeout=300)
     except requests.ConnectionError:
@@ -210,12 +267,16 @@ def anthropic_chat(model, messages, tool_specs):
     except requests.Timeout:
         print(f"ERROR: Request to {url} timed out (300s)", file=sys.stderr)
         return None
+    elapsed = _time.time() - t0
 
     if not resp.ok:
         print(f"ERROR: {url} returned {resp.status_code}: {resp.text[:300]}", file=sys.stderr)
         return None
 
     data = resp.json()
+    usage = data.get("usage", {})
+    _log_api(model, messages, usage, elapsed)
+
     content_blocks = data.get("content", [])
 
     text_parts = []
@@ -255,6 +316,7 @@ def _openai_compatible_chat(model, messages, tool_specs, api_key, base_url):
     if tool_specs:
         body["tools"] = tool_specs
 
+    t0 = _time.time()
     try:
         resp = requests.post(url, headers=headers, json=body, timeout=300)
     except requests.ConnectionError:
@@ -272,11 +334,16 @@ def _openai_compatible_chat(model, messages, tool_specs, api_key, base_url):
         except (requests.ConnectionError, requests.Timeout):
             return None
 
+    elapsed = _time.time() - t0
+
     if not resp.ok:
         print(f"ERROR: {url} returned {resp.status_code}: {resp.text[:300]}", file=sys.stderr)
         return None
 
     data = resp.json()
+    usage = data.get("usage", {})
+    _log_api(model, messages, usage, elapsed)
+
     choices = data.get("choices", [])
     if not choices:
         print("ERROR: No choices in response", file=sys.stderr)

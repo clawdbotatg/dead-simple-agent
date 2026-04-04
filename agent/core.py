@@ -15,7 +15,7 @@ import sys
 import textwrap
 import time
 
-from .providers import detect_provider, get_chat_fn
+from .providers import detect_provider, get_chat_fn, context_chars, estimate_cost, cumulative_cost, PRICING
 from .sessions import (
     append_messages,
     create_session,
@@ -49,6 +49,96 @@ def _truncate_args(args):
     return json.dumps(short)
 
 
+def _compact_context(messages, keep_recent=10):
+    """Truncate old tool outputs to reduce context size.
+
+    Preserves: system msg, user msg, and the last `keep_recent` messages.
+    Truncates tool message content to 200 chars for everything older.
+    """
+    if len(messages) <= keep_recent + 2:
+        return 0
+    cutoff = len(messages) - keep_recent
+    saved = 0
+    for i in range(cutoff):
+        msg = messages[i]
+        if msg.get("role") == "tool":
+            content = msg.get("content", "")
+            if len(content) > 250:
+                original_len = len(content)
+                msg["content"] = content[:200] + f"\n... [truncated from {original_len} chars]"
+                saved += original_len - len(msg["content"])
+        elif msg.get("role") == "assistant":
+            for tc in msg.get("tool_calls", []):
+                args = tc.get("function", {}).get("arguments", "")
+                if isinstance(args, str) and len(args) > 250:
+                    original_len = len(args)
+                    tc["function"]["arguments"] = args[:200] + f"... [truncated from {original_len} chars]"
+                    saved += original_len - len(tc["function"]["arguments"])
+                elif isinstance(args, dict):
+                    args_str = json.dumps(args)
+                    if len(args_str) > 250:
+                        tc["function"]["arguments"] = {"_truncated": args_str[:200] + f"... [{len(args_str)} chars]"}
+                        saved += len(args_str) - 250
+    return saved
+
+
+def _debug_dashboard(iteration, max_iter, model, messages, total_tool_calls, running_cost):
+    """Print the step-debugger dashboard and wait for user input."""
+    from .providers import context_chars, estimate_cost, PRICING
+    ctx = context_chars(messages)
+    ctx_k = f"{ctx // 1000}K" if ctx >= 1000 else str(ctx)
+    est_tokens = ctx // 4
+    prices = PRICING.get(model, (5.0, 15.0))
+    est_call_cost = est_tokens / 1_000_000 * prices[0]
+
+    last_actions = []
+    for msg in reversed(messages[-10:]):
+        if msg.get("role") == "tool":
+            content = msg.get("content", "")
+            preview = content[:80].replace("\n", " ")
+            last_actions.append(f"    -> {preview}{'...' if len(content) > 80 else ''}")
+        elif msg.get("role") == "assistant":
+            for tc in msg.get("tool_calls", []):
+                name = tc.get("function", {}).get("name", "?")
+                last_actions.append(f"    {name}")
+            text = (msg.get("content") or "").strip()
+            if text:
+                last_actions.append(f"    AI: \"{text[:100]}{'...' if len(text) > 100 else ''}\"")
+        if len(last_actions) >= 6:
+            break
+    last_actions.reverse()
+
+    bar = "=" * 50
+    print(f"\n{bar}", file=sys.stderr)
+    print(f"  ITERATION {iteration + 1} / {max_iter}  |  Tool calls: {total_tool_calls}", file=sys.stderr)
+    print(f"  Model: {model}", file=sys.stderr)
+    print(f"  Context: {len(messages)} msgs, ~{ctx_k} chars (~{est_tokens:,} tokens)", file=sys.stderr)
+    print(f"  Est. cost this call: ~${est_call_cost:.3f}", file=sys.stderr)
+    print(f"  Running total: ~${running_cost:.2f}", file=sys.stderr)
+    if last_actions:
+        print(f"  Last actions:", file=sys.stderr)
+        for a in last_actions:
+            print(f"  {a}", file=sys.stderr)
+    print(bar, file=sys.stderr)
+    print("  [Enter] continue | [c] compact context | [q] quit", file=sys.stderr)
+
+    try:
+        cmd = input("  > ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        cmd = "q"
+
+    if cmd == "q":
+        print("DEBUG: user quit", file=sys.stderr)
+        return "quit"
+    elif cmd == "c":
+        saved = _compact_context(messages)
+        new_ctx = context_chars(messages)
+        new_k = f"{new_ctx // 1000}K" if new_ctx >= 1000 else str(new_ctx)
+        print(f"  Compacted: saved {saved:,} chars. Context now: {new_k}", file=sys.stderr)
+        return "continue"
+    return "continue"
+
+
 def _load_env(env_file):
     """Load a .env file into os.environ (setdefault, won't override)."""
     if not os.path.exists(env_file):
@@ -75,6 +165,7 @@ class Agent:
         sessions_dir=None,
         env_file=None,
         max_iterations=10,
+        debug=False,
     ):
         cwd = os.getcwd()
 
@@ -93,6 +184,7 @@ class Agent:
 
         # Config
         self.max_iterations = max_iterations
+        self.debug = debug
 
         # Build system prompt
         self.system_prompt = self._build_prompt(system_prompt)
@@ -134,6 +226,8 @@ class Agent:
 
     def agent_turn(self, chat_fn, model, messages):
         """Run one user turn (may involve multiple tool-call rounds)."""
+        from . import providers as _prov
+
         new_messages = []
         turn_start = time.time()
         total_tool_calls = 0
@@ -142,12 +236,19 @@ class Agent:
         _MAX_SAME_ERROR = 3
 
         for iteration in range(self.max_iterations):
-            iter_start = time.time()
+            if self.debug:
+                action = _debug_dashboard(
+                    iteration, self.max_iterations, model, messages,
+                    total_tool_calls, _prov.cumulative_cost,
+                )
+                if action == "quit":
+                    _log_agent(f"debug quit after {iteration} iterations, {total_tool_calls} calls")
+                    return new_messages
+
             result = chat_fn(model, messages, get_tool_specs(self.tools))
-            api_ms = int((time.time() - iter_start) * 1000)
 
             if result is None:
-                _log_agent(f"iter={iteration+1} api returned None after {api_ms}ms")
+                _log_agent(f"iter={iteration+1} api returned None")
                 return new_messages
 
             content = result.get("content", "").strip()
@@ -158,7 +259,8 @@ class Agent:
                 messages.append(assistant_msg)
                 new_messages.append(assistant_msg)
                 elapsed = int(time.time() - turn_start)
-                _log_agent(f"done: {iteration+1} iterations, {total_tool_calls} tool calls, {elapsed}s")
+                _log_agent(f"done: {iteration+1} iters, {total_tool_calls} calls, "
+                           f"{elapsed}s, ${_prov.cumulative_cost:.2f}")
                 print(content)
                 return new_messages
 
@@ -213,7 +315,7 @@ class Agent:
 
         elapsed = int(time.time() - turn_start)
         _log_agent(f"ERROR: max iterations ({self.max_iterations}) reached after "
-                   f"{total_tool_calls} tool calls, {elapsed}s")
+                   f"{total_tool_calls} calls, {elapsed}s, ${_prov.cumulative_cost:.2f}")
         print("ERROR: max iterations reached", file=sys.stderr)
         return new_messages
 
@@ -378,6 +480,10 @@ class Agent:
             "--provider", default=None,
             help="Provider backend: ollama, venice, openrouter, ... (default: auto-detect)",
         )
+        parser.add_argument(
+            "--debug", action="store_true",
+            help="Step-debugger: pause before each LLM call showing cost and context stats",
+        )
         group = parser.add_mutually_exclusive_group()
         group.add_argument(
             "--new", action="store_true",
@@ -393,6 +499,9 @@ class Agent:
 
         if prompt and args.resume:
             parser.error("Cannot combine a prompt with --resume")
+
+        if args.debug:
+            self.debug = True
 
         provider_name = args.provider or detect_provider(args.model)
         try:
