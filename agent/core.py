@@ -313,6 +313,13 @@ class Agent:
         _MAX_SAME_ERROR = 3
 
         for iteration in range(self.max_iterations):
+            phase, intent = _detect_phase(messages)
+            ctx = context_chars(messages)
+            est_tokens = ctx // 4
+            prices = PRICING.get(model, (5.0, 15.0))
+            est_call_cost = est_tokens / 1_000_000 * prices[0]
+            intent_short = (intent[:50] + "...") if intent and len(intent) > 50 else (intent or "")
+
             if self.debug:
                 action = _debug_dashboard(
                     iteration, self.max_iterations, model, messages,
@@ -321,6 +328,12 @@ class Agent:
                 if action == "quit":
                     _log_agent(f"debug quit after {iteration} iterations, {total_tool_calls} calls")
                     return new_messages
+            else:
+                _log_agent(
+                    f"{iteration+1}/{self.max_iterations} [{total_tool_calls}] "
+                    f"({phase}) \"{intent_short}\" -- {model} "
+                    f"~{est_tokens:,} tok ~${est_call_cost:.3f} [~${_prov.cumulative_cost:.2f}]"
+                )
 
             result = chat_fn(model, messages, get_tool_specs(self.tools))
 
