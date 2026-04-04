@@ -83,19 +83,35 @@ class JobWatcher:
         self._resume_counts = {}  # job_id -> number of resume cycles
 
     def _dispatch(self, job, attempt=1, resume=False):
-        """Run the agent once for a job. Returns True if job completed on-chain."""
+        """Run the agent once for a job. Returns True if job completed on-chain.
+
+        prompt_builder can return a string or a (prompt, model_override) tuple.
+        If model_override is provided, it's passed to run.py via AGENT_MODEL env var.
+        """
         job_id = job["id"]
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         tag = "resume" if resume else f"attempt{attempt}"
         log_file = os.path.join(self.logs_dir, f"job-{job_id}-{tag}-{timestamp}.log")
 
-        prompt = self.prompt_builder(job, attempt, resume)
+        result = self.prompt_builder(job, attempt, resume)
+        if isinstance(result, tuple):
+            prompt, model_override = result
+        else:
+            prompt, model_override = result, None
 
-        _log(f"Dispatching agent for Job #{job_id} ({tag}) -> {log_file}")
+        env = os.environ.copy()
+        if model_override:
+            env["AGENT_MODEL"] = model_override
+            _log(f"Dispatching agent for Job #{job_id} ({tag}) model={model_override} -> {log_file}")
+        else:
+            _log(f"Dispatching agent for Job #{job_id} ({tag}) -> {log_file}")
 
         with open(log_file, "w") as lf:
             lf.write(f"=== Job #{job_id} — {tag} — {timestamp} ===\n")
-            lf.write(f"Client: {job.get('client', 'unknown')}\n---\n")
+            lf.write(f"Client: {job.get('client', 'unknown')}\n")
+            if model_override:
+                lf.write(f"Model: {model_override}\n")
+            lf.write("---\n")
             lf.flush()
 
             try:
@@ -105,6 +121,7 @@ class JobWatcher:
                     stdout=lf,
                     stderr=subprocess.STDOUT,
                     timeout=self.agent_timeout,
+                    env=env,
                 )
                 lf.write(f"\n=== Exit code: {proc.returncode} ===\n")
             except subprocess.TimeoutExpired:
