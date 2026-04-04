@@ -20,6 +20,13 @@ from datetime import datetime, timezone
 # ---------------------------------------------------------------------------
 
 def _run_shell(args):
+    cmd = args.get("cmd")
+    if not cmd or not isinstance(cmd, str) or not cmd.strip():
+        return (
+            "ERROR: 'cmd' parameter is missing or empty. "
+            "You must provide a shell command string. "
+            "Example: shell({\"cmd\": \"ls -la\"})"
+        )
     try:
         env = os.environ.copy()
         home = os.path.expanduser("~")
@@ -29,7 +36,7 @@ def _run_shell(args):
             + env.get("PATH", "")
         )
         result = subprocess.run(
-            args["cmd"], shell=True, capture_output=True, text=True,
+            cmd, shell=True, capture_output=True, text=True,
             timeout=30, env=env,
         )
         output = result.stdout or ""
@@ -69,12 +76,31 @@ def _run_read_file(args):
 
 
 def _run_write_file(args):
+    content = args.get("content")
+    path_arg = args.get("path")
+    if not path_arg:
+        return "ERROR: 'path' parameter is missing. Provide the file path to write to."
+    if content is None or not isinstance(content, str):
+        return (
+            f"ERROR: 'content' parameter is missing or not a string for '{path_arg}'. "
+            "This usually means the file content was too large and got dropped from "
+            "the tool call. FIX: Break the file into smaller pieces. Write the first "
+            "half with write_file, then use shell to append the rest:\n"
+            "  shell({{\"cmd\": \"cat >> {path} << 'CHUNK'\\n...content...\\nCHUNK\"}})\n"
+            "Or write smaller files. Do NOT retry the same call — it will fail again."
+        )
+    if len(content) == 0:
+        return (
+            f"ERROR: 'content' is an empty string for '{path_arg}'. "
+            "If you meant to create an empty file, use: shell({{\"cmd\": \"touch {path_arg}\"}}). "
+            "Otherwise, provide the file content."
+        )
     try:
-        path = os.path.expanduser(args["path"])
+        path = os.path.expanduser(path_arg)
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
         with open(path, "w") as f:
-            f.write(args["content"])
-        return f"Written to {path}"
+            f.write(content)
+        return f"Written to {path} ({len(content)} chars)"
     except Exception as e:
         return f"ERROR: {e}"
 
@@ -256,7 +282,7 @@ BASE_TOOLS = [
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Write content to a file",
+                "description": "Write content to a file. For large files (>200 lines), write in chunks: first call write_file with the first half, then use shell with 'cat >> file << CHUNK' to append the rest.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -594,5 +620,14 @@ def run_tool(registry, name, args):
     """Dispatch a tool call by name. Returns the tool's string output."""
     for t in registry:
         if t["spec"]["function"]["name"] == name:
+            required = t["spec"]["function"].get("parameters", {}).get("required", [])
+            missing = [p for p in required if p not in args]
+            if missing:
+                return (
+                    f"ERROR: missing required parameter(s): {missing}. "
+                    f"Tool '{name}' requires: {required}. "
+                    f"You provided: {list(args.keys())}. "
+                    f"Re-call with all required parameters."
+                )
             return t["run"](args)
     return f"ERROR: unknown tool '{name}'"

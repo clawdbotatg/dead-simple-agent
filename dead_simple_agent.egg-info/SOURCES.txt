@@ -1,8 +1,11 @@
 README.md
 pyproject.toml
 agent/__init__.py
+agent/bgipfs.py
 agent/core.py
 agent/default_prompt.md
+agent/jobs.py
+agent/leftclaw.py
 agent/providers.py
 agent/sessions.py
 agent/tools.py

@@ -13,6 +13,7 @@ import os
 import readline  # noqa: F401 — imported for input() line-editing support
 import sys
 import textwrap
+import time
 
 from .providers import detect_provider, get_chat_fn
 from .sessions import (
@@ -27,6 +28,25 @@ from .tools import BASE_TOOLS, get_tool_specs, get_tool_summary, make_memory_too
 
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_PROMPT = os.path.join(_PACKAGE_DIR, "default_prompt.md")
+
+
+def _log_agent(msg):
+    from datetime import datetime
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", file=sys.stderr)
+
+
+def _truncate_args(args):
+    """Summarize tool args for logging — truncate long values like file content."""
+    if not args:
+        return "{}"
+    short = {}
+    for k, v in args.items():
+        if isinstance(v, str) and len(v) > 120:
+            short[k] = v[:60] + f"...({len(v)} chars)"
+        else:
+            short[k] = v
+    return json.dumps(short)
 
 
 def _load_env(env_file):
@@ -97,7 +117,16 @@ class Agent:
                 critical_memory = f.read().strip()
         critical_memory = critical_memory or "(No critical memories yet. Use memory_write with filename 'critical.md' to create one.)"
 
-        return raw.replace("{{TOOLS}}", tool_summary).replace("{{MEMORY}}", critical_memory)
+        raw = raw.replace("{{TOOLS}}", tool_summary).replace("{{MEMORY}}", critical_memory)
+
+        if "{{WORKER_ADDRESS}}" in raw:
+            try:
+                from .leftclaw import worker_address
+                raw = raw.replace("{{WORKER_ADDRESS}}", worker_address())
+            except Exception:
+                raw = raw.replace("{{WORKER_ADDRESS}}", "(could not derive — ETH_PRIVATE_KEY missing?)")
+
+        return raw
 
     # ------------------------------------------------------------------
     # Agent loop
@@ -106,10 +135,19 @@ class Agent:
     def agent_turn(self, chat_fn, model, messages):
         """Run one user turn (may involve multiple tool-call rounds)."""
         new_messages = []
+        turn_start = time.time()
+        total_tool_calls = 0
+        error_streak = 0
+        last_error_key = None
+        _MAX_SAME_ERROR = 3
 
-        for _ in range(self.max_iterations):
+        for iteration in range(self.max_iterations):
+            iter_start = time.time()
             result = chat_fn(model, messages, get_tool_specs(self.tools))
+            api_ms = int((time.time() - iter_start) * 1000)
+
             if result is None:
+                _log_agent(f"iter={iteration+1} api returned None after {api_ms}ms")
                 return new_messages
 
             content = result.get("content", "").strip()
@@ -119,6 +157,8 @@ class Agent:
                 assistant_msg = {"role": "assistant", "content": content}
                 messages.append(assistant_msg)
                 new_messages.append(assistant_msg)
+                elapsed = int(time.time() - turn_start)
+                _log_agent(f"done: {iteration+1} iterations, {total_tool_calls} tool calls, {elapsed}s")
                 print(content)
                 return new_messages
 
@@ -133,17 +173,47 @@ class Agent:
             for call in tool_calls:
                 fn = call["function"]
                 name = fn["name"]
-                args = fn["arguments"] if isinstance(fn["arguments"], dict) else json.loads(fn["arguments"])
+                try:
+                    args = fn["arguments"] if isinstance(fn["arguments"], dict) else json.loads(fn["arguments"])
+                except (json.JSONDecodeError, TypeError) as e:
+                    args = {}
+                    _log_agent(f"WARNING: could not parse arguments for {name}: {e}")
                 call_id = call.get("id", "call_0")
 
-                print(f"\U0001f527 {name}({json.dumps(args)})", file=sys.stderr)
+                total_tool_calls += 1
+                _log_agent(f"iter={iteration+1} call={total_tool_calls} {name}({_truncate_args(args)})")
                 output = run_tool(self.tools, name, args)
-                print(f"   \u2192 {output[:300]}{'...' if len(output) > 300 else ''}", file=sys.stderr)
+                _log_agent(f"   → {output[:200]}{'...' if len(output) > 200 else ''}")
+
+                is_error = output.startswith("ERROR:")
+                error_key = f"{name}:{output[:80]}" if is_error else None
+
+                if is_error and error_key == last_error_key:
+                    error_streak += 1
+                elif is_error:
+                    error_streak = 1
+                    last_error_key = error_key
+                else:
+                    error_streak = 0
+                    last_error_key = None
+
+                if error_streak >= _MAX_SAME_ERROR:
+                    output += (
+                        f"\n\n⚠️ STOP: You have made the same failing call {error_streak} times in a row. "
+                        f"Retrying will NOT work. You MUST try a different approach. "
+                        f"For write_file errors: break the content into smaller chunks or use "
+                        f"shell with heredoc (cat >> file << 'EOF'). "
+                        f"For shell errors: make sure you pass the 'cmd' parameter."
+                    )
+                    _log_agent(f"⚠️  repeated error x{error_streak}: {name} — injected guidance")
 
                 tool_msg = {"role": "tool", "tool_call_id": call_id, "content": output}
                 messages.append(tool_msg)
                 new_messages.append(tool_msg)
 
+        elapsed = int(time.time() - turn_start)
+        _log_agent(f"ERROR: max iterations ({self.max_iterations}) reached after "
+                   f"{total_tool_calls} tool calls, {elapsed}s")
         print("ERROR: max iterations reached", file=sys.stderr)
         return new_messages
 
