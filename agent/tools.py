@@ -19,6 +19,9 @@ from datetime import datetime, timezone
 # Tool implementations
 # ---------------------------------------------------------------------------
 
+_LONG_COMMANDS = ("yarn build", "yarn deploy", "npm run build", "npx ", "forge test",
+                  "forge script", "forge create", "bgipfs", "yarn install", "npm install")
+
 def _run_shell(args):
     cmd = args.get("cmd")
     if not cmd or not isinstance(cmd, str) or not cmd.strip():
@@ -27,6 +30,7 @@ def _run_shell(args):
             "You must provide a shell command string. "
             "Example: shell({\"cmd\": \"ls -la\"})"
         )
+    timeout = 120 if any(lc in cmd for lc in _LONG_COMMANDS) else 30
     try:
         env = os.environ.copy()
         home = os.path.expanduser("~")
@@ -37,14 +41,14 @@ def _run_shell(args):
         )
         result = subprocess.run(
             cmd, shell=True, capture_output=True, text=True,
-            timeout=30, env=env,
+            timeout=timeout, env=env,
         )
         output = result.stdout or ""
         if result.stderr:
             output += "\nSTDERR: " + result.stderr
         return output.strip() or "(no output)"
     except subprocess.TimeoutExpired:
-        return "ERROR: command timed out"
+        return f"ERROR: command timed out after {timeout}s"
     except Exception as e:
         return f"ERROR: {e}"
 
