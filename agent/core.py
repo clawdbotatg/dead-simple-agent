@@ -373,9 +373,10 @@ class Agent:
                 call_id = call.get("id", "call_0")
 
                 total_tool_calls += 1
-                _log_agent(f"iter={iteration+1} call={total_tool_calls} {name}({_truncate_args(args)})")
+                _log_agent(f"  {name}({_truncate_args(args)})")
                 output = run_tool(self.tools, name, args)
-                _log_agent(f"   → {output[:200]}{'...' if len(output) > 200 else ''}")
+                out_preview = output[:120].replace("\n", " ")
+                _log_agent(f"    → {out_preview}{'...' if len(output) > 120 else ''}")
 
                 is_error = output.startswith("ERROR:")
                 error_key = f"{name}:{output[:80]}" if is_error else None

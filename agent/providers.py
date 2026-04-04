@@ -59,22 +59,14 @@ def context_chars(messages):
 
 
 def _log_api(model, messages, usage, elapsed_s):
+    """Update cumulative cost counters from API response usage data."""
     global cumulative_cost, cumulative_input_tokens, cumulative_output_tokens
-    ts = _datetime.now().strftime("%H:%M:%S")
-    ctx = context_chars(messages)
     tok_in = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
     tok_out = usage.get("completion_tokens") or usage.get("output_tokens") or 0
     cost = estimate_cost(model, tok_in, tok_out)
     cumulative_cost += cost
     cumulative_input_tokens += tok_in
     cumulative_output_tokens += tok_out
-    ctx_k = f"{ctx // 1000}K" if ctx >= 1000 else str(ctx)
-    print(
-        f"[{ts}] API {model} msgs={len(messages)} ctx={ctx_k} "
-        f"tok_in={tok_in} tok_out={tok_out} "
-        f"cost=${cost:.3f} total=${cumulative_cost:.2f} time={elapsed_s:.1f}s",
-        file=sys.stderr,
-    )
 
 
 # ---------------------------------------------------------------------------
