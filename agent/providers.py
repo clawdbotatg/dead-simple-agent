@@ -42,6 +42,21 @@ cumulative_cost = 0.0
 cumulative_input_tokens = 0
 cumulative_output_tokens = 0
 
+# Sub-agent cost tracking (subset of cumulative totals)
+subagent_cost = 0.0
+subagent_input_tokens = 0
+subagent_output_tokens = 0
+subagent_calls = 0
+_in_subagent = False
+
+
+_PROXY_HEADERS = [
+    ("LLM_PROXY_JOB_NAME",  "X-Job-Name"),
+    ("LLM_PROXY_ITERATION", "X-Iteration"),
+    ("LLM_PROXY_PHASE",     "X-Phase"),
+    ("LLM_PROXY_INTENT",    "X-Intent"),
+]
+
 
 def estimate_cost(model, input_tokens, output_tokens):
     prices = PRICING.get(model, (5.0, 15.0))
@@ -58,15 +73,39 @@ def context_chars(messages):
     return total
 
 
+class subagent_tracking:
+    """Context manager to tag LLM calls as sub-agent calls for cost tracking.
+
+    Usage:
+        with subagent_tracking():
+            result = chat_fn(model, messages, tools)
+    """
+    def __enter__(self):
+        global _in_subagent
+        _in_subagent = True
+        return self
+
+    def __exit__(self, *exc):
+        global _in_subagent
+        _in_subagent = False
+        return False
+
+
 def _log_api(model, messages, usage, elapsed_s):
     """Update cumulative cost counters from API response usage data."""
     global cumulative_cost, cumulative_input_tokens, cumulative_output_tokens
+    global subagent_cost, subagent_input_tokens, subagent_output_tokens, subagent_calls
     tok_in = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
     tok_out = usage.get("completion_tokens") or usage.get("output_tokens") or 0
     cost = estimate_cost(model, tok_in, tok_out)
     cumulative_cost += cost
     cumulative_input_tokens += tok_in
     cumulative_output_tokens += tok_out
+    if _in_subagent:
+        subagent_cost += cost
+        subagent_input_tokens += tok_in
+        subagent_output_tokens += tok_out
+        subagent_calls += 1
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +277,10 @@ def anthropic_chat(model, messages, tool_specs):
 
     url = f"{base_url.rstrip('/')}/v1/messages"
     headers = {"anthropic-version": "2023-06-01", "Content-Type": "application/json", "x-api-key": api_key}
+    for env_key, header in _PROXY_HEADERS:
+        val = os.environ.get(env_key)
+        if val:
+            headers[header] = val
     body = {
         "model": model,
         "max_tokens": 4096,
@@ -301,6 +344,10 @@ def _openai_compatible_chat(model, messages, tool_specs, api_key, base_url):
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+    for env_key, header in _PROXY_HEADERS:
+        val = os.environ.get(env_key)
+        if val:
+            headers[header] = val
     body = {
         "model": model,
         "messages": messages,

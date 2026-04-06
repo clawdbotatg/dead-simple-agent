@@ -21,6 +21,22 @@ from datetime import datetime, timezone
 
 _LONG_COMMANDS = ("yarn build", "yarn deploy", "npm run build", "npx ", "forge test",
                   "forge script", "forge create", "bgipfs", "yarn install", "npm install")
+_MAX_SHELL_OUTPUT = 4000
+_MAX_SHELL_LONG = 8000
+
+
+def _truncate_output(output, limit):
+    """Truncate long output keeping head + tail so the agent sees both
+    the command start and the final status/error lines."""
+    if len(output) <= limit:
+        return output
+    half = limit // 2
+    return (
+        output[:half]
+        + f"\n\n... [{len(output):,} chars total — middle truncated] ...\n\n"
+        + output[-half:]
+    )
+
 
 def _run_shell(args):
     cmd = args.get("cmd")
@@ -31,6 +47,7 @@ def _run_shell(args):
             "Example: shell({\"cmd\": \"ls -la\"})"
         )
     timeout = 120 if any(lc in cmd for lc in _LONG_COMMANDS) else 30
+    is_long = any(lc in cmd for lc in _LONG_COMMANDS)
     try:
         env = os.environ.copy()
         home = os.path.expanduser("~")
@@ -46,7 +63,9 @@ def _run_shell(args):
         output = result.stdout or ""
         if result.stderr:
             output += "\nSTDERR: " + result.stderr
-        return output.strip() or "(no output)"
+        output = output.strip() or "(no output)"
+        limit = _MAX_SHELL_LONG if is_long else _MAX_SHELL_OUTPUT
+        return _truncate_output(output, limit)
     except subprocess.TimeoutExpired:
         return f"ERROR: command timed out after {timeout}s"
     except Exception as e:
@@ -71,10 +90,19 @@ def _run_fetch_url(args):
         return f"ERROR: {e}"
 
 
+_MAX_READ_CHARS = 12000
+
+
 def _run_read_file(args):
     try:
         with open(os.path.expanduser(args["path"]), "r") as f:
-            return f.read()
+            content = f.read()
+        if len(content) > _MAX_READ_CHARS:
+            content = content[:_MAX_READ_CHARS] + (
+                f"\n\n... [truncated from {len(content):,} chars. "
+                f"Use shell with head/tail/grep for specific sections.]"
+            )
+        return content
     except Exception as e:
         return f"ERROR: {e}"
 
@@ -105,6 +133,39 @@ def _run_write_file(args):
         with open(path, "w") as f:
             f.write(content)
         return f"Written to {path} ({len(content)} chars)"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+def _run_patch_file(args):
+    """Replace a specific string in a file (cross-platform sed alternative)."""
+    path_arg = args.get("path")
+    old = args.get("old_string")
+    new = args.get("new_string")
+    if not path_arg:
+        return "ERROR: 'path' parameter is missing."
+    if not old:
+        return "ERROR: 'old_string' parameter is missing."
+    if new is None:
+        return "ERROR: 'new_string' parameter is missing."
+    if old == new:
+        return "ERROR: old_string and new_string are identical."
+    try:
+        path = os.path.expanduser(path_arg)
+        with open(path, "r") as f:
+            content = f.read()
+        if old not in content:
+            return f"ERROR: old_string not found in {path_arg}"
+        line_num = content[: content.index(old)].count("\n") + 1
+        updated = content.replace(old, new, 1)
+        with open(path, "w") as f:
+            f.write(updated)
+        basename = os.path.basename(path)
+        old_preview = old.strip().replace("\n", "\\n")[:60]
+        new_preview = new.strip().replace("\n", "\\n")[:60]
+        return f"Patched line {line_num} of {basename}: '{old_preview}' -> '{new_preview}'"
+    except FileNotFoundError:
+        return f"ERROR: file not found: {path_arg}"
     except Exception as e:
         return f"ERROR: {e}"
 
@@ -298,6 +359,25 @@ BASE_TOOLS = [
             },
         },
         "run": _run_write_file,
+    },
+    {
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "patch_file",
+                "description": "Replace a specific string in a file (cross-platform, no sed needed). Use for surgical edits instead of rewriting the entire file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to the file to patch"},
+                        "old_string": {"type": "string", "description": "The exact text to find and replace (first occurrence)"},
+                        "new_string": {"type": "string", "description": "The replacement text"},
+                    },
+                    "required": ["path", "old_string", "new_string"],
+                },
+            },
+        },
+        "run": _run_patch_file,
     },
     {
         "spec": {

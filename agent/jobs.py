@@ -100,6 +100,7 @@ class JobWatcher:
             prompt, model_override = result, None
 
         env = os.environ.copy()
+        env["LLM_PROXY_JOB_NAME"] = f"job-{job_id}-{tag}"
         if model_override:
             env["AGENT_MODEL"] = model_override
             _log(f"Dispatching agent for Job #{job_id} ({tag}) model={model_override} -> {log_file}")
