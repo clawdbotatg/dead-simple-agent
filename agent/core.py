@@ -51,6 +51,63 @@ def _truncate_args(args):
     return json.dumps(short)
 
 
+def _compact_args(fn, name, args_was_str):
+    """Compact a single tool call's arguments, preserving the original type.
+
+    Returns bytes saved. Mutates fn["arguments"] in place.
+    Always keeps arguments as the same type (str or dict) it started as.
+    """
+    saved = 0
+    args = fn.get("arguments", "" if args_was_str else {})
+
+    if args_was_str and isinstance(args, str):
+        if len(args) <= 250:
+            return 0
+        original_len = len(args)
+        try:
+            parsed = json.loads(args)
+        except (json.JSONDecodeError, TypeError):
+            fn["arguments"] = json.dumps({"_compacted": True})
+            return original_len - len(fn["arguments"])
+
+        if not isinstance(parsed, dict):
+            fn["arguments"] = json.dumps({"_compacted": True})
+            return original_len - len(fn["arguments"])
+
+        parsed = _compact_dict_args(name, parsed)
+        fn["arguments"] = json.dumps(parsed)
+        return original_len - len(fn["arguments"])
+
+    if isinstance(args, dict):
+        args_before = json.dumps(args)
+        if len(args_before) <= 250:
+            return 0
+        compacted = _compact_dict_args(name, args)
+        fn["arguments"] = compacted
+        return len(args_before) - len(json.dumps(compacted))
+
+    return 0
+
+
+def _compact_dict_args(name, args):
+    """Compact a parsed dict of tool arguments by name."""
+    if name == "write_file" and "content" in args:
+        content = args.get("content", "")
+        if len(content) > 100:
+            args["content"] = f"[written to disk, {len(content)} chars]"
+    elif name == "delegate" and "task" in args:
+        task = args.get("task", "")
+        if len(task) > 200:
+            args["task"] = task[:200] + "..."
+        for key in ("files", "skills", "tools"):
+            if key in args and isinstance(args[key], list) and len(json.dumps(args[key])) > 100:
+                args[key] = [f"[{len(args[key])} items]"]
+    else:
+        if len(json.dumps(args)) > 250:
+            args = {"_compacted": True, "name": name}
+    return args
+
+
 def _compact_context(messages, keep_recent=10):
     """Truncate old tool outputs to reduce context size.
 
@@ -74,43 +131,8 @@ def _compact_context(messages, keep_recent=10):
             for tc in msg.get("tool_calls", []):
                 fn = tc.get("function", {})
                 name = fn.get("name", "")
-                args = fn.get("arguments", "")
-                if isinstance(args, dict):
-                    if name == "write_file" and "content" in args:
-                        content_len = len(args.get("content", ""))
-                        if content_len > 100:
-                            saved += content_len - 60
-                            args["content"] = f"[written to disk, {content_len} chars]"
-                    elif name == "delegate" and "task" in args:
-                        task = args.get("task", "")
-                        if len(task) > 200:
-                            saved += len(task) - 200
-                            args["task"] = task[:200] + "..."
-                        for key in ("files", "skills", "tools"):
-                            if key in args and isinstance(args[key], list) and len(json.dumps(args[key])) > 100:
-                                saved += len(json.dumps(args[key])) - 20
-                                args[key] = [f"[{len(args[key])} items]"]
-                    else:
-                        args_str = json.dumps(args)
-                        if len(args_str) > 250:
-                            saved += len(args_str) - 250
-                            fn["arguments"] = {"_truncated": args_str[:200] + f"... [{len(args_str)} chars]"}
-                elif isinstance(args, str) and len(args) > 250:
-                    original_len = len(args)
-                    try:
-                        parsed = json.loads(args)
-                        if isinstance(parsed, dict):
-                            if "task" in parsed:
-                                parsed["task"] = parsed["task"][:200] + "..."
-                            for key in list(parsed.keys()):
-                                if key != "task" and isinstance(parsed[key], (list, str)) and len(json.dumps(parsed[key])) > 100:
-                                    parsed[key] = "[compacted]"
-                            fn["arguments"] = json.dumps(parsed)
-                        else:
-                            fn["arguments"] = json.dumps({"_compacted": True})
-                    except (json.JSONDecodeError, TypeError):
-                        fn["arguments"] = json.dumps({"_compacted": True})
-                    saved += original_len - len(fn["arguments"])
+                args_was_str = isinstance(fn.get("arguments", ""), str)
+                saved += _compact_args(fn, name, args_was_str)
     return saved
 
 
@@ -616,6 +638,31 @@ class Agent:
                     url = args.get("url", "")
                     if self.skill_cache.try_cache_url(url, output):
                         _log_agent(f"    📚 cached skill: {url[:60]}")
+
+                # Detect unrecoverable errors that should not be retried
+                _FATAL_PATTERNS = (
+                    "insufficient funds",
+                    "insufficient balance",
+                    "nonce too low",
+                    "execution reverted",
+                    "out of gas",
+                    "replacement transaction underpriced",
+                    "already known",
+                    "intrinsic gas too low",
+                    "max fee per gas less than block base fee",
+                    "could not fund deployment",
+                )
+                _output_lower = output.lower()
+                for _fp in _FATAL_PATTERNS:
+                    if _fp in _output_lower:
+                        output += (
+                            f"\n\n🛑 FATAL: Unrecoverable error detected ('{_fp}'). "
+                            f"Do NOT retry this operation — it will fail the same way. "
+                            f"Diagnose the root cause (wrong chain? empty wallet? bad nonce?) "
+                            f"and either fix the underlying issue or abort this step."
+                        )
+                        _log_agent(f"🛑 FATAL error detected: '{_fp}' in {name} output")
+                        break
 
                 is_error = output.startswith("ERROR:")
                 error_key = f"{name}:{output[:80]}" if is_error else None

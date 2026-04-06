@@ -506,6 +506,21 @@ def make_subagent_tools(chat_fn, default_model, skill_cache, all_tools=None,
                 err_tag = " ✗" if is_err else ""
                 _log_sub(f"  {label}{err_tag}")
 
+                _FATAL_PATTERNS = (
+                    "insufficient funds", "insufficient balance",
+                    "nonce too low", "execution reverted",
+                    "could not fund deployment",
+                )
+                _out_lower = output.lower()
+                for _fp in _FATAL_PATTERNS:
+                    if _fp in _out_lower:
+                        output += (
+                            f"\n\n🛑 FATAL: '{_fp}' — do NOT retry. "
+                            f"Report this error and stop."
+                        )
+                        _log_sub(f"  🛑 FATAL: '{_fp}'")
+                        break
+
                 _iter_tc_data.append({
                     "name": name, "label": label,
                     "output": output, "is_error": is_err,
