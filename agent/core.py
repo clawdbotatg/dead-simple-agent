@@ -416,7 +416,7 @@ class Agent:
         error_streak = 0
         last_error_key = None
         _MAX_SAME_ERROR = 3
-        _MAX_API_RETRIES = 2
+        _MAX_API_RETRIES = 4
         api_retries = 0
 
         _AUTO_COMPACT_THRESHOLD = 80_000

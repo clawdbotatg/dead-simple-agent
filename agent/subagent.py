@@ -168,6 +168,7 @@ def _make_limited_tools():
 _BGIPFS_KEYWORDS = ("deploy", "upload", "ipfs", "bgipfs", "build the frontend")
 _DEFAULT_MAX_ITERS = 15
 _MAX_SUB_COST = 0.50
+_MAX_SUB_COST_EXPENSIVE = 1.50
 _SUB_COMPACT_THRESHOLD = 30_000  # chars — keep sub-agents lean
 
 def make_subagent_tools(chat_fn, default_model, skill_cache, all_tools=None,
@@ -208,16 +209,26 @@ def make_subagent_tools(chat_fn, default_model, skill_cache, all_tools=None,
         tool_names = args.get("tools", [])
         model = args.get("model") or default_model
         max_iters = args.get("max_iterations", _DEFAULT_MAX_ITERS)
-        cost_limit = args.get("max_cost", _MAX_SUB_COST)
+        _EXPENSIVE_PREFIXES = ("claude-",)
+        is_expensive = any(model.startswith(p) for p in _EXPENSIVE_PREFIXES)
 
-        # Merge default skills unless caller opts out
-        if default_skills and not args.get("skip_default_skills", False):
+        default_cost = _MAX_SUB_COST_EXPENSIVE if is_expensive else _MAX_SUB_COST
+        cost_limit = args.get("max_cost", default_cost)
+
+        # Auto-skip default skills for expensive models to save tokens
+        skip_defaults = args.get("skip_default_skills", False)
+        if not skip_defaults and is_expensive:
+            skip_defaults = True
+            _log_sub(f"  auto-skipping default skills for expensive model {model}")
+
+        if default_skills and not skip_defaults:
             for s in default_skills:
                 if s not in skills:
                     skills.append(s)
-        task_lower = task.lower()
-        if "bgipfs" not in skills and any(kw in task_lower for kw in _BGIPFS_KEYWORDS):
-            skills.append("bgipfs")
+        if not is_expensive:
+            task_lower = task.lower()
+            if "bgipfs" not in skills and any(kw in task_lower for kw in _BGIPFS_KEYWORDS):
+                skills.append("bgipfs")
 
         active_tools = _build_tool_set(tool_names)
         active_names = [t["spec"]["function"]["name"] for t in active_tools]
@@ -239,12 +250,15 @@ def make_subagent_tools(chat_fn, default_model, skill_cache, all_tools=None,
             if doc:
                 skill_text += f"\n---\n## Rules: {tag}\n{doc}\n"
 
-        # 2. Read file contents
+        # 2. Read file contents (cap more aggressively for expensive models)
+        _max_file = 6000 if is_expensive else 12000
         file_text = ""
         for path in files:
             try:
                 with open(os.path.expanduser(path), "r") as f:
                     content = f.read()
+                if len(content) > _max_file:
+                    content = content[:_max_file] + f"\n... [truncated to {_max_file} chars]"
                 file_text += f"\n## File: {path}\n```\n{content}\n```\n"
             except Exception as e:
                 file_text += f"\n## File: {path}\nERROR reading: {e}\n"
@@ -278,10 +292,11 @@ def make_subagent_tools(chat_fn, default_model, skill_cache, all_tools=None,
         cost_before = _prov.subagent_cost
         total_calls = 0
         sub_api_retries = 0
+        _compact_at = 20_000 if is_expensive else _SUB_COMPACT_THRESHOLD
         for iteration in range(max_iters):
             sub_ctx = sum(len(m.get("content", "") or "") for m in messages)
 
-            if sub_ctx > _SUB_COMPACT_THRESHOLD:
+            if sub_ctx > _compact_at:
                 saved = _compact_context(messages, keep_recent=6)
                 if saved > 0:
                     sub_ctx = sum(len(m.get("content", "") or "") for m in messages)
@@ -305,13 +320,13 @@ def make_subagent_tools(chat_fn, default_model, skill_cache, all_tools=None,
             with subagent_tracking():
                 result = chat_fn(model, messages, get_tool_specs(active_tools))
             if result is None:
-                if sub_api_retries < 2:
+                if sub_api_retries < 3:
                     sub_api_retries += 1
-                    if sub_api_retries == 2:
+                    if sub_api_retries == 3:
                         saved = _compact_context(messages, keep_recent=4)
                         if saved > 0:
                             _log_sub(f"  compacted {saved:,} chars before final retry")
-                    _log_sub(f"  api returned None, retry {sub_api_retries}/2")
+                    _log_sub(f"  api returned None, retry {sub_api_retries}/3")
                     import time as _time
                     _time.sleep(2 ** sub_api_retries)
                     continue

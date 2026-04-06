@@ -273,6 +273,17 @@ def _run_github_search_code(args):
     return _gh(f'search code "{q}" --limit {limit} --json repository,path,textMatches')
 
 
+def _run_github_create_repo(args):
+    name = args["name"]
+    private = args.get("private", False)
+    visibility = "--private" if private else "--public"
+    description = args.get("description", "")
+    cmd = f'repo create {name} {visibility} --clone=false'
+    if description:
+        cmd += f' --description "{description}"'
+    return _gh(cmd)
+
+
 def _run_github_create_pr(args):
     repo = args["repo"]
     title = args["title"]
@@ -494,6 +505,25 @@ BASE_TOOLS = [
             },
         },
         "run": _run_github_search_code,
+    },
+    {
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "github_create_repo",
+                "description": "Create a new GitHub repository. Returns the repo URL on success.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Repository name (e.g. 'owner/repo-name' or just 'repo-name' for your own account)"},
+                        "private": {"type": "boolean", "description": "Create as private repo (default: false = public)"},
+                        "description": {"type": "string", "description": "Repository description"},
+                    },
+                    "required": ["name"],
+                },
+            },
+        },
+        "run": _run_github_create_repo,
     },
     {
         "spec": {
