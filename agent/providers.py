@@ -27,15 +27,16 @@ import requests
 # Cost tracking and per-call logging
 # ---------------------------------------------------------------------------
 
+# (input $/1M, output $/1M, cached_input $/1M)
 PRICING = {
-    "claude-opus-4.6": (15.0, 75.0),
-    "claude-opus-4-20250514": (15.0, 75.0),
-    "claude-sonnet-4.6": (3.0, 15.0),
-    "claude-sonnet-4-20250514": (3.0, 15.0),
-    "claude-haiku-3.5": (0.80, 4.0),
-    "gpt-4o": (2.50, 10.0),
-    "gpt-4o-mini": (0.15, 0.60),
-    "minimax-m2.7": (0.50, 1.50),
+    "claude-opus-4.6": (15.0, 75.0, 1.50),
+    "claude-opus-4-20250514": (15.0, 75.0, 1.50),
+    "claude-sonnet-4.6": (3.0, 15.0, 0.30),
+    "claude-sonnet-4-20250514": (3.0, 15.0, 0.30),
+    "claude-haiku-3.5": (0.80, 4.0, 0.08),
+    "gpt-4o": (2.50, 10.0, 0.0),
+    "gpt-4o-mini": (0.15, 0.60, 0.0),
+    "minimax-m2.7": (0.50, 1.50, 0.0),
 }
 
 cumulative_cost = 0.0
@@ -58,9 +59,14 @@ _PROXY_HEADERS = [
 ]
 
 
-def estimate_cost(model, input_tokens, output_tokens):
-    prices = PRICING.get(model, (5.0, 15.0))
-    return (input_tokens / 1_000_000 * prices[0]) + (output_tokens / 1_000_000 * prices[1])
+def estimate_cost(model, input_tokens, output_tokens, cached_tokens=0):
+    prices = PRICING.get(model, (5.0, 15.0, 0.0))
+    fresh_input = max(input_tokens - cached_tokens, 0)
+    return (
+        (fresh_input / 1_000_000 * prices[0])
+        + (output_tokens / 1_000_000 * prices[1])
+        + (cached_tokens / 1_000_000 * prices[2])
+    )
 
 
 def context_chars(messages):
@@ -97,7 +103,12 @@ def _log_api(model, messages, usage, elapsed_s):
     global subagent_cost, subagent_input_tokens, subagent_output_tokens, subagent_calls
     tok_in = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
     tok_out = usage.get("completion_tokens") or usage.get("output_tokens") or 0
-    cost = estimate_cost(model, tok_in, tok_out)
+    tok_cached = (
+        usage.get("cache_read_input_tokens")
+        or (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+        or 0
+    )
+    cost = estimate_cost(model, tok_in, tok_out, tok_cached)
     cumulative_cost += cost
     cumulative_input_tokens += tok_in
     cumulative_output_tokens += tok_out
@@ -212,8 +223,8 @@ def _convert_messages_to_anthropic(messages):
     """OpenAI-style messages -> Anthropic (system, messages) pair.
 
     Handles: system extraction, assistant tool_calls -> tool_use blocks,
-    tool role -> user tool_result blocks, and merging consecutive same-role
-    messages (which Anthropic forbids).
+    tool role -> user tool_result blocks, merging consecutive same-role
+    messages (which Anthropic forbids), and cache_control markers.
     """
     system = ""
     anthropic_msgs = []
@@ -222,11 +233,19 @@ def _convert_messages_to_anthropic(messages):
         role = msg.get("role")
 
         if role == "system":
-            system = msg.get("content", "")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                system = content
+            else:
+                system = content
             continue
 
         if role == "user":
-            anthropic_msgs.append({"role": "user", "content": msg["content"]})
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                anthropic_msgs.append({"role": "user", "content": content})
+            else:
+                anthropic_msgs.append({"role": "user", "content": content})
 
         elif role == "assistant":
             content_blocks = []
@@ -276,7 +295,12 @@ def anthropic_chat(model, messages, tool_specs):
     system, anthropic_msgs = _convert_messages_to_anthropic(messages)
 
     url = f"{base_url.rstrip('/')}/v1/messages"
-    headers = {"anthropic-version": "2023-06-01", "Content-Type": "application/json", "x-api-key": api_key}
+    headers = {
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+        "x-api-key": api_key,
+        "anthropic-beta": "prompt-caching-2024-07-31",
+    }
     for env_key, header in _PROXY_HEADERS:
         val = os.environ.get(env_key)
         if val:
@@ -380,6 +404,13 @@ def _openai_compatible_chat(model, messages, tool_specs, api_key, base_url):
         return None
 
     data = resp.json()
+
+    if "error" in data:
+        err = data["error"]
+        err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+        print(f"ERROR: API returned error: {err_msg[:300]}", file=sys.stderr)
+        return None
+
     usage = data.get("usage", {})
     _log_api(model, messages, usage, elapsed)
 

@@ -170,9 +170,11 @@ _DEFAULT_MAX_ITERS = 15
 _MAX_SUB_COST = 0.50
 _MAX_SUB_COST_EXPENSIVE = 1.50
 _SUB_COMPACT_THRESHOLD = 30_000  # chars — keep sub-agents lean
+_OPUS_BUDGET_LIMIT = 2.00  # total opus spend across all sub-agents per job
+_opus_cumulative_cost = 0.0
 
 def make_subagent_tools(chat_fn, default_model, skill_cache, all_tools=None,
-                        default_skills=None):
+                        default_skills=None, debug_log=None):
     """Return tools that can spawn focused sub-agents.
 
     Parameters:
@@ -181,6 +183,7 @@ def make_subagent_tools(chat_fn, default_model, skill_cache, all_tools=None,
         skill_cache:    SkillCache instance (shared with main agent)
         all_tools:      The main agent's full tool registry, for selective forwarding
         default_skills: Skill tags always injected into every sub-agent (e.g. ["ethskills", "scaffoldeth"])
+        debug_log:      Optional DebugLog instance for audit logging
     """
     base_limited = _make_limited_tools()
     base_names = {t["spec"]["function"]["name"] for t in base_limited}
@@ -199,6 +202,7 @@ def make_subagent_tools(chat_fn, default_model, skill_cache, all_tools=None,
         return tools
 
     def _run_delegate(args):
+        global _opus_cumulative_cost
         task = args.get("task")
         if not task:
             return "ERROR: 'task' parameter is required."
@@ -212,8 +216,17 @@ def make_subagent_tools(chat_fn, default_model, skill_cache, all_tools=None,
         _EXPENSIVE_PREFIXES = ("claude-",)
         is_expensive = any(model.startswith(p) for p in _EXPENSIVE_PREFIXES)
 
+        if "opus" in model and _opus_cumulative_cost >= _OPUS_BUDGET_LIMIT:
+            return (
+                f"ERROR: Opus budget exhausted (${_opus_cumulative_cost:.2f} >= ${_OPUS_BUDGET_LIMIT:.2f}). "
+                f"Use a cheaper model (claude-sonnet-4.6 or minimax-m2.7) for this task."
+            )
+
         default_cost = _MAX_SUB_COST_EXPENSIVE if is_expensive else _MAX_SUB_COST
         cost_limit = args.get("max_cost", default_cost)
+        if is_expensive and cost_limit > _MAX_SUB_COST_EXPENSIVE:
+            _log_sub(f"  capping cost from ${cost_limit:.2f} to ${_MAX_SUB_COST_EXPENSIVE:.2f} for {model}")
+            cost_limit = _MAX_SUB_COST_EXPENSIVE
 
         # Auto-skip default skills for expensive models to save tokens
         skip_defaults = args.get("skip_default_skills", False)
@@ -250,7 +263,76 @@ def make_subagent_tools(chat_fn, default_model, skill_cache, all_tools=None,
             if doc:
                 skill_text += f"\n---\n## Rules: {tag}\n{doc}\n"
 
-        # 2. Read file contents (cap more aggressively for expensive models)
+        # 2. Handle AGENTS.md for SE2 projects.
+        #    For expensive models: extract only the frontend-relevant sections
+        #    (hook API, components, styling) instead of the full 8K+ file.
+        #    For cheap models: leave the full file in the preload list.
+        _agents_md_extra = ""
+        _AGENTS_SECTIONS = [
+            "### Frontend Contract Interaction",
+            "### UI Components",
+            "### Notifications",
+            "### Styling",
+            "### Import Paths",
+            "### Creating Pages",
+        ]
+
+        def _extract_agents_sections(path):
+            with open(path) as _af:
+                _full = _af.read()
+            _sections = []
+            for header in _AGENTS_SECTIONS:
+                idx = _full.find(header)
+                if idx >= 0:
+                    end = _full.find("\n### ", idx + len(header))
+                    if end < 0:
+                        end = _full.find("\n## ", idx + len(header))
+                    if end < 0:
+                        end = len(_full)
+                    _sections.append(_full[idx:end].strip())
+            return "\n\n".join(_sections) if _sections else ""
+
+        # If AGENTS.md is explicitly preloaded, remove it from files for
+        # expensive models (we'll inject extracted sections instead)
+        _explicit_agents = [p for p in files if p.endswith("AGENTS.md")]
+        if _explicit_agents and is_expensive:
+            files = [p for p in files if not p.endswith("AGENTS.md")]
+            try:
+                _agents_md_extra = _extract_agents_sections(_explicit_agents[0])
+                if _agents_md_extra:
+                    _log_sub(f"  extracted AGENTS.md sections ({len(_agents_md_extra)} chars, "
+                             f"saved ~{8000 - len(_agents_md_extra)} chars)")
+            except Exception:
+                files = list(files) + _explicit_agents  # fallback: keep full file
+
+        # If no AGENTS.md was preloaded, auto-detect it from sibling dirs
+        if not _explicit_agents and not _agents_md_extra and files:
+            _agents_path = None
+            for p in files:
+                candidate = os.path.join(os.path.dirname(p), "AGENTS.md")
+                while candidate and len(candidate) > 10:
+                    if os.path.isfile(candidate):
+                        _agents_path = candidate
+                        break
+                    parent = os.path.dirname(os.path.dirname(candidate))
+                    candidate = os.path.join(parent, "AGENTS.md")
+                    if parent == os.path.dirname(parent):
+                        break
+                if _agents_path:
+                    break
+            if _agents_path:
+                try:
+                    if is_expensive:
+                        _agents_md_extra = _extract_agents_sections(_agents_path)
+                        if _agents_md_extra:
+                            _log_sub(f"  auto-injected AGENTS.md sections ({len(_agents_md_extra)} chars)")
+                    else:
+                        files = list(files) + [_agents_path]
+                        _log_sub(f"  auto-preloaded AGENTS.md: {_agents_path}")
+                except Exception as e:
+                    _log_sub(f"  failed to read AGENTS.md: {e}")
+
+        # Read file contents (cap more aggressively for expensive models)
         _max_file = 6000 if is_expensive else 12000
         file_text = ""
         for path in files:
@@ -267,13 +349,17 @@ def make_subagent_tools(chat_fn, default_model, skill_cache, all_tools=None,
         system = (
             "You are a focused coding agent. Complete the task below efficiently.\n"
             f"You have access to: {', '.join(active_names)}.\n"
-            "Prefer patch_file for surgical edits over rewriting entire files.\n"
-            "Complete the task and stop. Do not explore beyond what is needed.\n"
+            "RULES:\n"
+            "- You have LIMITED iterations. Use preloaded files below instead of exploring with ls/find.\n"
+            "- Prefer patch_file for surgical edits, write_file for new files.\n"
+            "- Complete the task and stop. Do not explore beyond what is needed.\n"
         )
         if skill_text:
             system += f"\n# Domain Rules\n{skill_text}"
 
         user = f"## Task\n\n{task}"
+        if _agents_md_extra:
+            user += f"\n\n# Project Conventions (from AGENTS.md)\n{_agents_md_extra}"
         if file_text:
             user += f"\n\n# Files\n{file_text}"
 
@@ -285,7 +371,42 @@ def make_subagent_tools(chat_fn, default_model, skill_cache, all_tools=None,
         ctx_chars = sum(len(m.get("content", "")) for m in messages)
         _log_sub(f"  sub-context: {ctx_chars:,} chars ({ctx_chars // 4:,} est tokens)")
 
-        # 4. Run mini agent loop
+        _debug_sid = None
+        if debug_log:
+            _debug_sid = debug_log.subagent_start(
+                model=model, task=task, files=files, skills=skills,
+                max_iters=max_iters,
+                system_prompt_len=len(system),
+                user_prompt_len=len(user),
+            )
+
+        # 4. Select chat function — use native Anthropic for Claude models
+        #    to enable prompt caching (90% cheaper on repeat prefixes).
+        _sub_chat_fn = chat_fn
+        if model.startswith("claude-"):
+            try:
+                from .providers import anthropic_chat
+                if os.environ.get("ANTHROPIC_API_KEY"):
+                    _sub_chat_fn = anthropic_chat
+                    _log_sub(f"  using native Anthropic provider (prompt caching enabled)")
+            except Exception:
+                pass
+
+        # Add cache_control markers to system and initial user message
+        # so Anthropic caches the prefix across sub-agent iterations.
+        if _sub_chat_fn is not chat_fn:
+            if isinstance(messages[0].get("content"), str):
+                messages[0]["content"] = [
+                    {"type": "text", "text": messages[0]["content"],
+                     "cache_control": {"type": "ephemeral"}}
+                ]
+            if len(messages) > 1 and isinstance(messages[1].get("content"), str):
+                messages[1]["content"] = [
+                    {"type": "text", "text": messages[1]["content"],
+                     "cache_control": {"type": "ephemeral"}}
+                ]
+
+        # 5. Run mini agent loop
         from .providers import subagent_tracking
         from .core import _compact_context
         from . import providers as _prov
@@ -308,6 +429,8 @@ def make_subagent_tools(chat_fn, default_model, skill_cache, all_tools=None,
             this_sub_cost = _prov.subagent_cost - cost_before
             if this_sub_cost >= cost_limit:
                 _log_sub(f"  SUB-AGENT COST LIMIT after {iteration} iters, {total_calls} calls")
+                if _debug_sid and debug_log:
+                    debug_log.subagent_end(_debug_sid, "cost_limit", iteration + 1, total_calls, this_sub_cost)
                 last_out = ""
                 for m in reversed(messages):
                     if m.get("role") == "tool":
@@ -318,7 +441,7 @@ def make_subagent_tools(chat_fn, default_model, skill_cache, all_tools=None,
             _log_sub(f"  iter {iteration + 1} ctx={sub_ctx_k} (~{est_tokens:,} tok)")
 
             with subagent_tracking():
-                result = chat_fn(model, messages, get_tool_specs(active_tools))
+                result = _sub_chat_fn(model, messages, get_tool_specs(active_tools))
             if result is None:
                 if sub_api_retries < 3:
                     sub_api_retries += 1
@@ -338,7 +461,15 @@ def make_subagent_tools(chat_fn, default_model, skill_cache, all_tools=None,
 
             if not tool_calls:
                 _log_sub(f"  done: {iteration + 1} iters, {total_calls} tool calls")
+                if "opus" in model:
+                    _opus_cumulative_cost += _prov.subagent_cost - cost_before
+                _sub_cost = _prov.subagent_cost - cost_before
+                if _debug_sid and debug_log:
+                    debug_log.subagent_end(_debug_sid, "completed", iteration + 1, total_calls, _sub_cost)
                 return f"Sub-agent done: {content[:500]}" if content else "Sub-agent completed (no output)"
+
+            if _debug_sid and debug_log and content:
+                debug_log.subagent_thinking(_debug_sid, content)
 
             messages.append({
                 "role": "assistant",
@@ -346,6 +477,7 @@ def make_subagent_tools(chat_fn, default_model, skill_cache, all_tools=None,
                 "tool_calls": tool_calls,
             })
 
+            _iter_tc_data = []
             for call in tool_calls:
                 fn = call["function"]
                 name = fn["name"]
@@ -357,7 +489,6 @@ def make_subagent_tools(chat_fn, default_model, skill_cache, all_tools=None,
                 total_calls += 1
                 output = run_tool(active_tools, name, tc_args)
 
-                # Human-readable one-liner for each tool call
                 if name == "read_file":
                     label = f"read {os.path.basename(tc_args.get('path', '?'))}"
                 elif name == "write_file":
@@ -375,13 +506,26 @@ def make_subagent_tools(chat_fn, default_model, skill_cache, all_tools=None,
                 err_tag = " ✗" if is_err else ""
                 _log_sub(f"  {label}{err_tag}")
 
+                _iter_tc_data.append({
+                    "name": name, "label": label,
+                    "output": output, "is_error": is_err,
+                })
+
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call.get("id", "sub_0"),
                     "content": output,
                 })
 
+            if _debug_sid and debug_log:
+                debug_log.subagent_iter(_debug_sid, iteration + 1, est_tokens, _iter_tc_data)
+
         _log_sub(f"  max iterations ({max_iters}) reached, {total_calls} tool calls")
+        _sub_cost = _prov.subagent_cost - cost_before
+        if "opus" in model:
+            _opus_cumulative_cost += _sub_cost
+        if _debug_sid and debug_log:
+            debug_log.subagent_end(_debug_sid, "max_iterations", max_iters, total_calls, _sub_cost)
         last_content = ""
         for m in reversed(messages):
             if m.get("role") == "tool":

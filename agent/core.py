@@ -26,6 +26,7 @@ from .sessions import (
 )
 from .tools import BASE_TOOLS, get_tool_specs, get_tool_summary, make_memory_tools, run_tool
 from .subagent import SkillCache, make_subagent_tools, _fetch_skill
+from .debuglog import DebugLog
 
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_PROMPT = os.path.join(_PACKAGE_DIR, "default_prompt.md")
@@ -75,20 +76,40 @@ def _compact_context(messages, keep_recent=10):
                 name = fn.get("name", "")
                 args = fn.get("arguments", "")
                 if isinstance(args, dict):
-                    # write_file content is on disk — replace with summary
                     if name == "write_file" and "content" in args:
                         content_len = len(args.get("content", ""))
                         if content_len > 100:
                             saved += content_len - 60
                             args["content"] = f"[written to disk, {content_len} chars]"
+                    elif name == "delegate" and "task" in args:
+                        task = args.get("task", "")
+                        if len(task) > 200:
+                            saved += len(task) - 200
+                            args["task"] = task[:200] + "..."
+                        for key in ("files", "skills", "tools"):
+                            if key in args and isinstance(args[key], list) and len(json.dumps(args[key])) > 100:
+                                saved += len(json.dumps(args[key])) - 20
+                                args[key] = [f"[{len(args[key])} items]"]
                     else:
                         args_str = json.dumps(args)
                         if len(args_str) > 250:
-                            fn["arguments"] = {"_truncated": args_str[:200] + f"... [{len(args_str)} chars]"}
                             saved += len(args_str) - 250
+                            fn["arguments"] = {"_truncated": args_str[:200] + f"... [{len(args_str)} chars]"}
                 elif isinstance(args, str) and len(args) > 250:
                     original_len = len(args)
-                    fn["arguments"] = args[:200] + f"... [truncated from {original_len} chars]"
+                    try:
+                        parsed = json.loads(args)
+                        if isinstance(parsed, dict):
+                            if "task" in parsed:
+                                parsed["task"] = parsed["task"][:200] + "..."
+                            for key in list(parsed.keys()):
+                                if key != "task" and isinstance(parsed[key], (list, str)) and len(json.dumps(parsed[key])) > 100:
+                                    parsed[key] = "[compacted]"
+                            fn["arguments"] = json.dumps(parsed)
+                        else:
+                            fn["arguments"] = json.dumps({"_compacted": True})
+                    except (json.JSONDecodeError, TypeError):
+                        fn["arguments"] = json.dumps({"_compacted": True})
                     saved += original_len - len(fn["arguments"])
     return saved
 
@@ -111,6 +132,17 @@ _STAGE_SIGNALS = {
     "patch_file": "patching file",
 }
 
+_SECRET_RE = None
+
+def _scrub_secrets(text):
+    """Remove potential secrets (private keys, API keys) from text."""
+    global _SECRET_RE
+    if _SECRET_RE is None:
+        import re as _re
+        _SECRET_RE = _re.compile(r'(?:0x)?[0-9a-fA-F]{40,}')
+    return _SECRET_RE.sub("[REDACTED]", text)
+
+
 def _detect_phase(messages):
     """Detect the current phase from recent tool calls and assistant thinking."""
     import re
@@ -126,9 +158,9 @@ def _detect_phase(messages):
                 if think_match:
                     raw = think_match.group(1).strip()
                     first_line = raw.split("\n")[0].strip()
-                    intent = first_line[:120]
+                    intent = _scrub_secrets(first_line[:120])
                 elif not text.startswith("<"):
-                    intent = text.split("\n")[0].strip()[:120]
+                    intent = _scrub_secrets(text.split("\n")[0].strip()[:120])
 
             for tc in msg.get("tool_calls", []):
                 name = tc.get("function", {}).get("name", "")
@@ -349,6 +381,7 @@ class Agent:
         self.max_iterations = max_iterations
         self.max_cost = max_cost
         self.debug = debug
+        self.debug_log = None  # set to DebugLog instance when --debug is used
 
         # Skill cache for sub-agent delegation (populated as skills are fetched)
         self.skill_cache = SkillCache()
@@ -421,6 +454,10 @@ class Agent:
 
         _AUTO_COMPACT_THRESHOLD = 80_000
 
+        # Circuit breaker: track delegate failures by goal keyword
+        _delegate_failures = {}  # keyword -> count
+        _DELEGATE_FAIL_LIMIT = 3
+
         for iteration in range(self.max_iterations):
             phase, intent = _detect_phase(messages)
             os.environ["LLM_PROXY_ITERATION"] = str(iteration)
@@ -438,7 +475,7 @@ class Agent:
             est_tokens = ctx // 4
             intent_short = (intent[:50] + "...") if intent and len(intent) > 50 else (intent or "")
 
-            if self.debug:
+            if self.debug and not self.debug_log:
                 action = _debug_dashboard(
                     iteration, self.max_iterations, model, messages,
                     total_tool_calls,
@@ -447,11 +484,17 @@ class Agent:
                 if action == "quit":
                     _log_agent(f"debug quit after {iteration} iterations, {total_tool_calls} calls")
                     return new_messages
-            else:
-                _log_agent(
-                    f"{iteration+1}/{self.max_iterations} [{total_tool_calls}] "
-                    f"({phase}) \"{intent_short}\" -- {model} "
-                    f"~{est_tokens:,} tok"
+
+            _log_agent(
+                f"{iteration+1}/{self.max_iterations} [{total_tool_calls}] "
+                f"({phase}) \"{intent_short}\" -- {model} "
+                f"~{est_tokens:,} tok"
+            )
+
+            if self.debug_log:
+                self.debug_log.iteration(
+                    iteration + 1, self.max_iterations, phase, intent,
+                    model, est_tokens, ctx, total_tool_calls,
                 )
 
             if self._exclude_tools:
@@ -469,9 +512,16 @@ class Agent:
                         if saved > 0:
                             _log_agent(f"  compacted {saved:,} chars before final retry")
                     _log_agent(f"iter={iteration+1} api returned None, retry {api_retries}/{_MAX_API_RETRIES}")
+                    if self.debug_log:
+                        self.debug_log.api_error(iteration + 1, api_retries, _MAX_API_RETRIES)
                     time.sleep(2 ** api_retries)
                     continue
                 _log_agent(f"iter={iteration+1} api returned None after {api_retries} retries")
+                if self.debug_log:
+                    self.debug_log.finalize(
+                        total_cost=_prov.cumulative_cost, total_iters=iteration + 1,
+                        total_tool_calls=total_tool_calls, outcome="api_failure",
+                    )
                 return new_messages
 
             api_retries = 0  # reset on successful API call
@@ -482,6 +532,14 @@ class Agent:
                     f"COST LIMIT: ${_prov.cumulative_cost:.2f} >= ${self.max_cost:.2f} "
                     f"after {iteration+1} iters, {total_tool_calls} calls"
                 )
+                if self.debug_log:
+                    self.debug_log.cost_limit(
+                        _prov.cumulative_cost, self.max_cost, iteration + 1, total_tool_calls,
+                    )
+                    self.debug_log.finalize(
+                        total_cost=_prov.cumulative_cost, total_iters=iteration + 1,
+                        total_tool_calls=total_tool_calls, outcome="cost_limit",
+                    )
                 content = result.get("content", "").strip()
                 if content:
                     messages.append({"role": "assistant", "content": content})
@@ -494,12 +552,20 @@ class Agent:
             content = result.get("content", "").strip()
             tool_calls = result.get("tool_calls", [])
 
+            if self.debug_log and content:
+                self.debug_log.thinking(content)
+
             if not tool_calls:
                 assistant_msg = {"role": "assistant", "content": content}
                 messages.append(assistant_msg)
                 new_messages.append(assistant_msg)
                 elapsed = int(time.time() - turn_start)
                 _log_agent(f"done: {iteration+1} iters, {total_tool_calls} calls, {elapsed}s")
+                if self.debug_log:
+                    self.debug_log.finalize(
+                        total_cost=_prov.cumulative_cost, total_iters=iteration + 1,
+                        total_tool_calls=total_tool_calls, outcome="completed",
+                    )
                 print(content)
                 return new_messages
 
@@ -542,6 +608,9 @@ class Agent:
                 out_preview = output[:120].replace("\n", " ")
                 _log_agent(f"    → {out_preview}{'...' if len(output) > 120 else ''}")
 
+                if self.debug_log:
+                    self.debug_log.tool_call(name, args, output, is_error=output.startswith("ERROR:"))
+
                 # Auto-cache skill docs when fetched
                 if name in ("fetch_url", "deep_fetch") and not output.startswith("ERROR:"):
                     url = args.get("url", "")
@@ -570,6 +639,36 @@ class Agent:
                     )
                     _log_agent(f"⚠️  repeated error x{error_streak}: {name} — injected guidance")
 
+                # Circuit breaker for delegate failures
+                if name == "delegate":
+                    _is_delegate_fail = (
+                        "max iterations" in output
+                        or "cost limit" in output
+                        or output.startswith("ERROR:")
+                    )
+                    if _is_delegate_fail:
+                        _task_text = (args.get("task", "") or "").lower()
+                        _goal_key = "unknown"
+                        for kw in ("frontend", "contract", "deploy", "scaffold",
+                                   "test", "build", "verify", "plan", "page.tsx"):
+                            if kw in _task_text:
+                                _goal_key = kw
+                                break
+                        _delegate_failures[_goal_key] = _delegate_failures.get(_goal_key, 0) + 1
+                        _fail_count = _delegate_failures[_goal_key]
+                        _log_agent(f"⚠️  delegate failed for '{_goal_key}' ({_fail_count}/{_DELEGATE_FAIL_LIMIT})")
+                        if _fail_count >= _DELEGATE_FAIL_LIMIT:
+                            output += (
+                                f"\n\n🛑 CIRCUIT BREAKER: {_fail_count} delegate failures for '{_goal_key}'. "
+                                f"Do NOT delegate this task again. Either: "
+                                f"(1) abort and report the failure, or "
+                                f"(2) try a completely different approach "
+                                f"(different model, write code via shell heredoc, break into smaller pieces)."
+                            )
+                            _log_agent(f"🛑 CIRCUIT BREAKER triggered for '{_goal_key}' after {_fail_count} failures")
+                            if self.debug_log:
+                                self.debug_log.circuit_breaker(_goal_key, _fail_count)
+
                 tool_msg = {"role": "tool", "tool_call_id": call_id, "content": output}
                 messages.append(tool_msg)
                 new_messages.append(tool_msg)
@@ -577,6 +676,11 @@ class Agent:
         elapsed = int(time.time() - turn_start)
         _log_agent(f"ERROR: max iterations ({self.max_iterations}) reached after "
                    f"{total_tool_calls} calls, {elapsed}s")
+        if self.debug_log:
+            self.debug_log.finalize(
+                total_cost=_prov.cumulative_cost, total_iters=self.max_iterations,
+                total_tool_calls=total_tool_calls, outcome="max_iterations",
+            )
         print("ERROR: max iterations reached", file=sys.stderr)
         return new_messages
 
@@ -587,6 +691,7 @@ class Agent:
                 chat_fn, model, self.skill_cache,
                 all_tools=self.tools,
                 default_skills=self._default_skills,
+                debug_log=self.debug_log,
             ))
             self._subagent_tools_wired = True
             # Rebuild system prompt so {{TOOLS}} includes delegate + patch_file
@@ -781,6 +886,9 @@ class Agent:
 
         if args.debug:
             self.debug = True
+            job_name = os.environ.get("LLM_PROXY_JOB_NAME")
+            debug_dir = os.path.join(os.getcwd(), "debug-runs")
+            self.debug_log = DebugLog(debug_dir, job_name=job_name)
         if args.max_cost is not None:
             self.max_cost = args.max_cost
 
