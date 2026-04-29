@@ -22,6 +22,8 @@ _CAST = os.path.expanduser("~/.foundry/bin/cast")
 
 _CONTRACT = None
 _WORKER_ADDRESS = None
+_AUTH_SIG = None
+_AUTH_MESSAGE = "LeftClaw Services Auth"
 
 
 def _fetch_contract():
@@ -54,6 +56,24 @@ def _rpc():
 
 def _privkey():
     return os.environ.get("ETH_PRIVATE_KEY", "")
+
+
+def _auth_signature():
+    """Signed `LeftClaw Services Auth` message — used as ?sig= for authed read endpoints."""
+    global _AUTH_SIG
+    if _AUTH_SIG:
+        return _AUTH_SIG
+    pk = _privkey()
+    if not pk:
+        raise RuntimeError("ETH_PRIVATE_KEY not set in .env")
+    result = subprocess.run(
+        [_CAST, "wallet", "sign", "--private-key", pk, _AUTH_MESSAGE],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0 or not result.stdout.strip().startswith("0x"):
+        raise RuntimeError(f"cast wallet sign failed: {result.stderr.strip() or result.stdout.strip()}")
+    _AUTH_SIG = result.stdout.strip()
+    return _AUTH_SIG
 
 
 def worker_address():
@@ -344,7 +364,9 @@ def make_leftclaw_tools(service_type_id, worker_addr=None):
     def _run_get_messages(args):
         try:
             job_id = args["job_id"]
-            url = f"{_LEFTCLAW_BASE}/api/job/{job_id}/messages"
+            addr = _resolve_addr()
+            sig = _auth_signature()
+            url = f"{_LEFTCLAW_BASE}/api/job/{job_id}/messages?address={addr}&sig={sig}"
             req = urllib.request.Request(url, headers={"User-Agent": "leftclaw-agent/1.0"})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode())
