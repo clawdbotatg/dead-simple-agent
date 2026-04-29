@@ -59,6 +59,11 @@ _PROXY_HEADERS = [
 ]
 
 
+def _safe_header(val):
+    """HTTP headers must be latin-1; strip anything outside that range."""
+    return val.encode("latin-1", "replace").decode("latin-1")
+
+
 def estimate_cost(model, input_tokens, output_tokens, cached_tokens=0):
     prices = PRICING.get(model, (5.0, 15.0, 0.0))
     fresh_input = max(input_tokens - cached_tokens, 0)
@@ -304,7 +309,7 @@ def anthropic_chat(model, messages, tool_specs):
     for env_key, header in _PROXY_HEADERS:
         val = os.environ.get(env_key)
         if val:
-            headers[header] = val
+            headers[header] = _safe_header(val)
     body = {
         "model": model,
         "max_tokens": 4096,
@@ -371,7 +376,7 @@ def _openai_compatible_chat(model, messages, tool_specs, api_key, base_url):
     for env_key, header in _PROXY_HEADERS:
         val = os.environ.get(env_key)
         if val:
-            headers[header] = val
+            headers[header] = _safe_header(val)
     body = {
         "model": model,
         "messages": messages,
